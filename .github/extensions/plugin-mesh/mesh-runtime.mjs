@@ -805,12 +805,13 @@ export class MeshRuntime {
     return { removed: true, id };
   }
 
-  async sendTask({ peerId, task, thread = "" }) {
+  async sendTask({ peerId, task, thread = "", noWake = false }) {
     const peer = this.state.peers.find((item) => item.id === peerId);
     if (!peer) throw new Error("Peer not found. Add and pair it first.");
     if (typeof task !== "string" || task.trim().length === 0) throw new Error("Task text is required.");
     if (Buffer.byteLength(task, "utf8") > MAX_TASK_LENGTH) throw new Error("Task text exceeds 256 KiB.");
     if (typeof thread !== "string" || thread.length > 128) throw new Error("Thread must be at most 128 characters.");
+    if (typeof noWake !== "boolean") throw new Error("noWake must be a boolean.");
 
     const id = `t-${randomBytes(12).toString("hex")}`;
     const record = {
@@ -819,6 +820,7 @@ export class MeshRuntime {
       peerName: peer.name,
       task,
       thread,
+      noWake,
       sentAt: new Date().toISOString(),
       status: "sending",
     };
@@ -840,7 +842,7 @@ export class MeshRuntime {
           fromMachine: this.state.name,
           from: this.state.name,
           thread: thread || undefined,
-          noWake: true,
+          noWake,
           task,
         }),
         signal: AbortSignal.timeout(8000),
@@ -858,7 +860,10 @@ export class MeshRuntime {
         accepted: true,
         id,
         status: record.status,
-        message: "Delivered as a no-wake task request; acceptance does not mean the task was executed.",
+        noWake,
+        message: noWake
+          ? "Delivered to the peer inbox without waking its agent."
+          : "Delivered; the peer's inbound policy decides whether to wake an agent.",
       };
     } catch (error) {
       record.status = "failed";

@@ -23,7 +23,7 @@ test("mesh runtime does not silently switch ports when the requested port is una
   assert.equal(runtime.port, null);
 });
 
-test("paired local peers can exchange review-only task requests", async (t) => {
+test("paired local peers receive DSH-default and explicit noWake task requests for review", async (t) => {
   const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
   const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
   const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
@@ -57,18 +57,30 @@ test("paired local peers can exchange review-only task requests", async (t) => {
   const sent = await sender.sendTask({ peerId: peer.id, task: "Review this request before doing anything." });
   assert.equal(sent.accepted, true);
   assert.equal(sent.status, "accepted-for-review");
+  assert.equal(sent.noWake, false);
+
+  const noWakeSent = await sender.sendTask({
+    peerId: peer.id,
+    task: "Keep this status notice in the inbox only.",
+    noWake: true,
+  });
+  assert.equal(noWakeSent.accepted, true);
+  assert.equal(noWakeSent.noWake, true);
 
   const inbox = receiver.localState().inbox;
-  assert.equal(inbox.length, 1);
-  assert.equal(inbox[0].status, "awaiting-review");
-  assert.equal(inbox[0].task, "Review this request before doing anything.");
-  assert.equal(inbox[0].noWake, true);
+  assert.equal(inbox.length, 2);
+  const normalTask = inbox.find((item) => item.task === "Review this request before doing anything.");
+  const noWakeTask = inbox.find((item) => item.task === "Keep this status notice in the inbox only.");
+  assert.equal(normalTask.status, "awaiting-review");
+  assert.equal(normalTask.noWake, false);
+  assert.equal(noWakeTask.status, "awaiting-review");
+  assert.equal(noWakeTask.noWake, true);
 
   const authenticatedTasks = await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/tasks`, {
     headers: { "X-Dsh-Mesh-Token": receiverState.token },
   });
   assert.equal(authenticatedTasks.status, 200);
-  assert.equal((await authenticatedTasks.json()).inbox.length, 1);
+  assert.equal((await authenticatedTasks.json()).inbox.length, 2);
   const peerTokenTasks = await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/tasks`, {
     headers: { "X-Dsh-Mesh-Token": senderState.token },
   });
