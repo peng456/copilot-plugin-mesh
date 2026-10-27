@@ -264,12 +264,8 @@ export class MeshRuntime {
         this.server.listen(this.requestedPort, this.host, resolveListen);
       });
     } catch (error) {
-      if (error.code !== "EADDRINUSE" && error.code !== "EACCES") throw error;
-      await new Promise((resolveListen, rejectListen) => {
-        this.server.removeAllListeners("error");
-        this.server.once("error", rejectListen);
-        this.server.listen(0, this.host, resolveListen);
-      });
+      this.server = null;
+      throw error;
     }
     this.port = this.server.address().port;
     if (this.discoveryEnabled) this.startDiscovery();

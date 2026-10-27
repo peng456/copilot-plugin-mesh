@@ -1,9 +1,27 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import { createMeshRuntime } from "./mesh-runtime.mjs";
+
+test("mesh runtime does not silently switch ports when the requested port is unavailable", async (t) => {
+  const blocker = createServer();
+  await new Promise((resolveListen) => blocker.listen(0, "0.0.0.0", resolveListen));
+  const port = blocker.address().port;
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const runtime = createMeshRuntime({ copilotHome: home, port, host: "0.0.0.0", discovery: false });
+  t.after(async () => {
+    await runtime.close();
+    await new Promise((resolveClose) => blocker.close(resolveClose));
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await runtime.initialize();
+  await assert.rejects(runtime.listen(), { code: "EADDRINUSE" });
+  assert.equal(runtime.port, null);
+});
 
 test("paired local peers can exchange review-only task requests", async (t) => {
   const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
