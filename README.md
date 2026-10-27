@@ -1,52 +1,42 @@
 # Copilot Plugin Mesh
 
-A Copilot CLI extension inspired by [dsh-plugin-mesh](https://github.com/peng456/dsh-plugin-mesh). It provides a small peer directory and a human-reviewed task inbox for connecting Copilot nodes over a trusted private network.
+Copilot CLI adaptation of the node discovery, capability-card, pairing, peer health, and task protocol in [dsh-plugin-mesh](https://github.com/peng456/dsh-plugin-mesh).
 
-The HTTP API is Copilot-specific and is not wire-compatible with the DSH plugin protocol.
+## Implemented
 
-## What it does
+- Stable 16-character node identity and editable 32-character machine name, persisted with a private pairing token under `$COPILOT_HOME/extensions/plugin-mesh/artifacts/mesh-state.json` (default: `~/.copilot/extensions/plugin-mesh/artifacts/mesh-state.json`).
+- DSH Mesh v2-compatible multicast cards (`239.255.42.99:45892`), IPv4 /24 health scan on port `45917`, periodic re-announcement, peer health checks, offline/expiry tracking, and private-network address reporting.
+- Bounded capability cards for OS, architecture, CPU, memory, and installed runtimes. Probe failures are reported as incomplete; local diagnostics are not broadcast.
+- DSH Mesh v1-style `/mesh/v1/health`, `/hello`, `/peers`, `/tasks`, and `/task` endpoints, including the `X-Dsh-Mesh-Token` header, idempotency, task size limits, and 0600 state-file permissions.
+- Mesh canvas for discovered/paired peers, explicit pairing, task dispatch, inbox review, and sent/received history.
+- Read-only agent-facing canvas actions: `mesh_status`, `mesh_peers`, and `mesh_tasks`. Peer pairing, scanning, task sending, copying, and dismissing stay user-driven canvas actions.
+- Local plugin registry and sequential invocation (`echo`, `time`, `uppercase`, `ping`).
 
-- Gives each installation a persistent node ID and a random pairing token.
-- Lets users add a peer by entering its private IP address, port, and pairing token.
-- Exposes authenticated health, peer, and task endpoints on the mesh listener.
-- Sends task requests to a paired node's inbox and persists received/sent history locally.
-- Keeps the existing local plugin registry and sequential plugin-chain demo.
+## Intentional safety boundary
 
-Received requests are untrusted text. They remain in the inbox until the user reviews them; the extension does **not** inject them into a Copilot session or execute them. The agent can inspect mesh status and task records, but pairing, sending, and dismissing requests are user-driven canvas actions.
+Incoming task bodies are untrusted text. They are persisted and displayed in the review inbox; the extension never wakes a Copilot agent, injects a task into a session, or executes a remote task. Outgoing requests include `noWake: true` for DSH peers. The user must explicitly inspect and decide what to do with an incoming request.
 
-## Pair two nodes
+Pairing is always required on this Copilot node. A discovered card is not a trusted peer: to pair, copy the peer's token over a trusted channel and complete the handshake in the canvas. The local token and tokens of explicitly paired peers are accepted for inbound requests, which supports DSH's shared-token pairing model. Tokens travel over plain HTTP, so use only a trusted private network or a separately secured tunnel. The listener binds to all interfaces; `/health` is public and the control endpoints require an accepted pairing token. The mesh refuses public IPs for manual pairing; discovery and active scanning are limited to local private IPv4 networks.
 
-1. Install this extension on both machines and open the **Copilot Mesh** canvas in a running Copilot session on each.
-2. On each machine, note a private address and port in the node panel, then reveal and copy that machine's pairing token using a trusted channel.
-3. On machine A, enter machine B's private-IP URL and token. On machine B, enter machine A's URL and token. The peer must answer the authenticated handshake before it is saved.
-4. Send a task request from the canvas. It appears in the other node's **待审核收件箱**; the recipient can inspect, copy, or ignore it.
+## Deliberate differences from dsh-plugin-mesh
 
-The URL must use a literal private, loopback, or link-local IP address, for example `http://192.168.1.20:45917`. Public addresses and hostnames are rejected. The listener defaults to port `45917` and falls back to an OS-assigned port if unavailable; use the actual port shown in the canvas. The extension starts the listener when its provider starts, whether or not the canvas is open.
+- The optional Tailscale/tsnet sidecar and non-LAN routing are not included.
+- This Copilot adapter does not provide `mesh_run` as an agent tool or automatically route inbound tasks into Copilot sessions. That would violate the review-only boundary above. Dispatch remains an explicit canvas action and is marked `noWake`.
+- The reference's configurable scan ranges/ports and full cross-session reply binding are not implemented.
 
-## Security and scope
+## Pair and use
 
-- The mesh listener binds to all network interfaces. Pairing is always required for control endpoints; the token is generated locally and stored with mode `0600`.
-- Pairing tokens travel over plain HTTP. Use only a trusted private network or a separately secured tunnel; this extension does not provide TLS.
-- Health exposes only the node ID, display name, and port. Other endpoints require the pairing token and use constant-time token comparison.
-- Requests are size-limited, task IDs are deduplicated, and remote task content is rendered as text.
-- There is no subnet scan, automatic peer discovery, public-network peer support, Tailscale integration, automatic agent wake-up, or remote command execution.
-- Run one active Copilot Mesh provider per machine. If the default port is occupied, the extension selects an ephemeral port, which is shown in the canvas and may change after restart.
+1. Install the extension on both nodes and open **Copilot Mesh**.
+2. The canvas displays multicast/scan discoveries, the local HTTP port, and a hidden-by-default pairing token. Reveal and transfer each token out of band.
+3. Pair each node from the other node's canvas. Discovery alone does not establish trust.
+4. Choose a paired peer and submit a task request. It is sent with `noWake: true`; inspect the delivery status because acceptance only confirms receipt.
+5. Review incoming tasks in the inbox. They may be copied or dismissed, but are never automatically sent to Copilot.
 
-State is stored under `$COPILOT_HOME/extensions/plugin-mesh/artifacts/mesh-state.json` (default: `~/.copilot/extensions/plugin-mesh/artifacts/mesh-state.json`).
+The listener uses port `45917` and falls back to an OS-assigned port if unavailable. Its current port is shown in the canvas. In fallback mode, multicast discovery advertises the selected port; active IPv4 scans use the reference port `45917`.
 
-## Canvas actions
+## Validation
 
-Read-only mesh actions available to the agent:
-
-- `mesh_status`
-- `mesh_peers`
-- `mesh_tasks`
-
-User-driven canvas controls manage pairing, sending, and dismissing. The existing local plugin actions remain available: `list_plugins`, `register_plugin`, and `invoke_plugin`.
-
-## Tests
-
-Use Node.js 20 or newer:
+Requires Node.js 20 or newer:
 
 ```bash
 node --check .github/extensions/plugin-mesh/extension.mjs

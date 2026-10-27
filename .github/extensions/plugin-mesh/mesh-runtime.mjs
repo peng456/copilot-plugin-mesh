@@ -1,14 +1,23 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { homedir, hostname, networkInterfaces } from "node:os";
-import { dirname, resolve } from "node:path";
+import { homedir, hostname, networkInterfaces, platform, release, cpus, totalmem } from "node:os";
+import { dirname, delimiter, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { isIP } from "node:net";
+import { createSocket } from "node:dgram";
 
 const API_PREFIX = "/mesh/v1";
-const MAX_TASK_LENGTH = 64 * 1024;
+const MAX_TASK_LENGTH = 256 * 1024;
 const MAX_REQUEST_LENGTH = MAX_TASK_LENGTH + 4096;
-const MAX_HISTORY = 100;
+const MAX_HISTORY = 200;
+const MULTICAST_GROUP = "239.255.42.99";
+const MULTICAST_PORT = 45892;
+const DEFAULT_PEER_PORT = 45917;
+const PEER_TTL_MS = 20_000;
+const PEER_KEEP_MS = 5 * 60_000;
+const execFileAsync = promisify(execFile);
 
 function isPrivateAddress(address) {
   const version = isIP(address);
@@ -55,6 +64,13 @@ function isValidToken(candidate, expected) {
   return supplied.length === wanted.length && timingSafeEqual(supplied, wanted);
 }
 
+function isValidPairingToken(value) {
+  return typeof value === "string"
+    && value.length >= 16
+    && value.length <= 256
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 function safePeer(peer) {
   return {
     id: peer.id,
@@ -77,15 +93,79 @@ function localAddresses() {
   return [...new Set(addresses)];
 }
 
+function sanitizeCapabilities(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const runtimes = {};
+  if (value.runtimes && typeof value.runtimes === "object" && !Array.isArray(value.runtimes)) {
+    for (const [name, version] of Object.entries(value.runtimes).slice(0, 20)) {
+      if (typeof name === "string" && typeof version === "string") {
+        runtimes[name.slice(0, 24)] = version.replace(/[^0-9A-Za-z.+_-]/g, "").slice(0, 24);
+      }
+    }
+  }
+  return {
+    os: typeof value.os === "string" ? value.os.slice(0, 96) : "",
+    arch: typeof value.arch === "string" ? value.arch.slice(0, 32) : "",
+    cpuCount: Number.isInteger(value.cpuCount ?? value.cpuCores)
+      ? Math.min(Math.max(value.cpuCount ?? value.cpuCores, 0), 1024)
+      : null,
+    memoryBytes: Number.isFinite(value.memoryBytes)
+      ? Math.max(0, Math.min(value.memoryBytes, 2 ** 60))
+      : Number.isFinite(value.memMb)
+        ? Math.max(0, Math.min(value.memMb, 1024 * 1024)) * 1024 * 1024
+        : null,
+    runtimes,
+    runtimesIncomplete: value.runtimesIncomplete === true,
+    probeFailCount: Number.isInteger(value.probeFailCount) ? Math.max(0, value.probeFailCount) : 0,
+    capabilitiesAt: Number.isFinite(value.capabilitiesAt) ? value.capabilitiesAt : 0,
+  };
+}
+
+async function probeCapabilities() {
+  const commands = ["node", "python3", "python", "go", "git", "docker", "ffmpeg"];
+  const pathEntries = (process.env.PATH || "").split(delimiter).filter(Boolean);
+  const runtimes = {};
+  const errors = [];
+  await Promise.all(commands.map(async (command) => {
+    try {
+      const { stdout } = await execFileAsync(command, ["--version"], { timeout: 1200, windowsHide: true });
+      runtimes[command] = stdout.match(/\d+(?:\.\d+){0,3}/)?.[0] || "unknown";
+    } catch (error) {
+      if (error.code !== "ENOENT") errors.push(command);
+    }
+  }));
+  const pathHash = createHash("sha256").update(pathEntries.join(delimiter)).digest("hex").slice(0, 16);
+  return {
+    os: `${platform()} ${release()}`.slice(0, 96),
+    arch: process.arch,
+    cpuCount: cpus().length,
+    memoryBytes: totalmem(),
+    runtimes,
+    runtimesIncomplete: errors.length > 0,
+    probeFailCount: errors.length,
+    capabilitiesAt: Date.now(),
+    pathEntries: pathEntries.slice(0, 64).map((entry) => entry.slice(0, 240)),
+    pathHash,
+    probeErrors: errors,
+  };
+}
+
 export class MeshRuntime {
-  constructor({ storageFile, port = 45917, host = "0.0.0.0" }) {
+  constructor({ storageFile, port = 45917, host = "0.0.0.0", discovery = true, discoveryGroup = MULTICAST_GROUP, discoveryPort = MULTICAST_PORT }) {
     this.storageFile = storageFile;
     this.requestedPort = port;
     this.host = host;
+    this.discoveryEnabled = discovery;
+    this.discoveryGroup = discoveryGroup;
+    this.discoveryPort = discoveryPort;
     this.state = null;
     this.server = null;
     this.port = null;
     this.persistQueue = Promise.resolve();
+    this.discoverySocket = null;
+    this.discoveryTimers = [];
+    this.capabilities = null;
+    this.discoveryError = "";
   }
 
   async initialize() {
@@ -98,33 +178,58 @@ export class MeshRuntime {
       }
       this.state = {
         version: 1,
-        nodeId: saved.nodeId,
+        nodeId: typeof saved.instanceId === "string" && /^[a-f0-9]{16}$/.test(saved.instanceId)
+          ? saved.instanceId
+          : typeof saved.nodeId === "string" && /^[a-f0-9]{32}$/.test(saved.nodeId)
+            ? saved.nodeId.slice(0, 16)
+            : saved.nodeId,
+        instanceId: typeof saved.instanceId === "string" && /^[a-f0-9]{16}$/.test(saved.instanceId)
+          ? saved.instanceId
+          : typeof saved.nodeId === "string" && /^[a-f0-9]{32}$/.test(saved.nodeId)
+            ? saved.nodeId.slice(0, 16)
+            : saved.nodeId,
         name: saved.name,
         token: saved.token,
         peers: saved.peers,
+        discovered: Array.isArray(saved.discovered) ? saved.discovered.slice(-MAX_HISTORY) : [],
         inbox: saved.inbox.slice(-MAX_HISTORY),
         sent: saved.sent.slice(-MAX_HISTORY),
       };
-      if (!/^[a-f0-9]{32}$/.test(this.state.nodeId) || typeof this.state.token !== "string" || !/^[A-Za-z0-9_-]{40,128}$/.test(this.state.token)) {
+      if (!/^[a-f0-9]{16}$/.test(this.state.nodeId) || !isValidPairingToken(this.state.token)) {
         throw new Error("Mesh state is missing a valid node identity or pairing token.");
       }
-      if (typeof this.state.name !== "string" || this.state.name.length < 1 || this.state.name.length > 64) {
+      if (typeof this.state.name !== "string" || !this.validName(this.state.name)) {
         throw new Error("Mesh state contains an invalid node name.");
       }
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
       this.state = {
         version: 1,
-        nodeId: randomBytes(16).toString("hex"),
-        name: hostname().slice(0, 64) || "Copilot node",
+        nodeId: randomBytes(8).toString("hex"),
+        instanceId: null,
+        name: hostname().slice(0, 32) || "Copilot node",
         token: randomBytes(32).toString("base64url"),
         peers: [],
+        discovered: [],
         inbox: [],
         sent: [],
       };
+      this.state.instanceId = this.state.nodeId;
       await this.persist();
     }
+    this.state.instanceId = this.state.nodeId;
     await chmod(this.storageFile, 0o600);
+    this.capabilities = await probeCapabilities();
+    this.state.discovered = this.state.discovered.filter((peer) =>
+      peer && typeof peer.nodeId === "string" && typeof peer.host === "string" && Number.isInteger(peer.port),
+    );
+  }
+
+  validName(name) {
+    return typeof name === "string"
+      && name.trim().length > 0
+      && name.length <= 32
+      && !/[\/\\\u0000-\u001f\u007f]/.test(name);
   }
 
   persist() {
@@ -167,14 +272,251 @@ export class MeshRuntime {
       });
     }
     this.port = this.server.address().port;
+    if (this.discoveryEnabled) this.startDiscovery();
     return this.port;
   }
 
   close() {
+    for (const timer of this.discoveryTimers) clearInterval(timer);
+    this.discoveryTimers = [];
+    if (this.discoverySocket) {
+      try {
+        this.discoverySocket.close();
+      } catch (error) {
+        if (error.code !== "ERR_SOCKET_DGRAM_NOT_RUNNING") throw error;
+      }
+      this.discoverySocket = null;
+    }
     if (!this.server?.listening) return Promise.resolve();
     return new Promise((resolveClose, rejectClose) => {
       this.server.close((error) => error ? rejectClose(error) : resolveClose());
     });
+  }
+
+  async setName(value) {
+    if (!this.validName(value)) {
+      throw new Error("Machine name must be 1–32 characters and contain no slash or control characters.");
+    }
+    this.state.name = value.trim();
+    await this.persist();
+    this.announce();
+    return { name: this.state.name };
+  }
+
+  selfRecord() {
+    const capabilities = this.capabilities
+      ? {
+        os: this.capabilities.os,
+        arch: this.capabilities.arch,
+        cpuCores: this.capabilities.cpuCount,
+        memMb: Math.round(this.capabilities.memoryBytes / (1024 * 1024)),
+        runtimes: this.capabilities.runtimes,
+        runtimesIncomplete: this.capabilities.runtimesIncomplete,
+        probeFailCount: this.capabilities.probeFailCount,
+        gpu: null,
+        workspaceHints: [],
+        capabilitiesAt: this.capabilities.capabilitiesAt,
+      }
+      : null;
+    return {
+      v: 2,
+      app: "dsh-mesh",
+      id: this.state.instanceId,
+      instanceId: this.state.instanceId,
+      nodeId: this.state.nodeId,
+      machine: this.state.name,
+      name: this.state.name,
+      hostname: hostname(),
+      host: localAddresses()[0] || "",
+      port: this.port,
+      os: this.capabilities?.os || "",
+      version: "1.0.0",
+      capabilities,
+      ts: Date.now(),
+    };
+  }
+
+  startDiscovery() {
+    if (this.discoverySocket) return;
+    const socket = createSocket({ type: "udp4", reuseAddr: true });
+    this.discoverySocket = socket;
+    socket.on("error", (error) => {
+      this.discoveryError = error.message.slice(0, 200);
+    });
+    socket.on("message", (message, remote) => {
+      if (message.length > 8192) return;
+      try {
+        const record = JSON.parse(message.toString("utf8"));
+        const peerId = record.id || record.instanceId || record.nodeId;
+        const peerName = record.machine || record.name;
+        if (!["dsh-mesh", "copilot-plugin-mesh"].includes(record.app)
+          || typeof peerId !== "string"
+          || !/^[a-f0-9]{16,32}$/.test(peerId)
+          || peerId === this.state.nodeId
+          || typeof peerName !== "string"
+          || !Number.isInteger(record.port)
+          || record.port < 1
+          || record.port > 65535
+          || !isPrivateAddress(remote.address)) return;
+        this.observePeer({
+          nodeId: peerId,
+          name: peerName.slice(0, 32),
+          host: remote.address,
+          port: record.port,
+          capabilities: sanitizeCapabilities(record.capabilities),
+          capabilitiesAt: Number.isFinite(record.capabilities?.capabilitiesAt) ? record.capabilities.capabilitiesAt : 0,
+          lastSeen: Date.now(),
+          paired: this.state.peers.some((peer) => peer.nodeId === peerId),
+        });
+      } catch {
+        return;
+      }
+    });
+    socket.bind(this.discoveryPort, "0.0.0.0", () => {
+      try {
+        socket.addMembership(this.discoveryGroup);
+        socket.setMulticastTTL(1);
+        socket.setMulticastLoopback(true);
+        this.announce();
+        const announceTimer = setInterval(() => this.announce(), 5000);
+        announceTimer.unref?.();
+        this.discoveryTimers.push(announceTimer);
+        const cleanupTimer = setInterval(() => this.expirePeers(), 5000);
+        cleanupTimer.unref?.();
+        this.discoveryTimers.push(cleanupTimer);
+        const healthTimer = setInterval(() => {
+          for (const peer of this.state.peers) {
+            this.refreshPeer(peer.id).catch((error) => {
+              const record = this.state.peers.find((item) => item.id === peer.id);
+              if (record?.status === "online") {
+                record.status = "offline";
+                record.lastError = error.message.slice(0, 160);
+                this.persist().catch(() => {});
+              }
+            });
+          }
+        }, 10_000);
+        healthTimer.unref?.();
+        this.discoveryTimers.push(healthTimer);
+        const scanTimer = setInterval(() => {
+          this.scan().catch((error) => { this.discoveryError = error.message.slice(0, 200); });
+        }, 60_000);
+        scanTimer.unref?.();
+        this.discoveryTimers.push(scanTimer);
+        const startupScan = setTimeout(() => {
+          this.scan().catch((error) => { this.discoveryError = error.message.slice(0, 200); });
+        }, 1500);
+        startupScan.unref?.();
+        this.discoveryTimers.push(startupScan);
+        const capabilityTimer = setInterval(async () => {
+          try {
+            this.capabilities = await probeCapabilities();
+            this.announce();
+          } catch (error) {
+            this.discoveryError = error.message.slice(0, 200);
+          }
+        }, 10 * 60_000);
+        capabilityTimer.unref?.();
+        this.discoveryTimers.push(capabilityTimer);
+      } catch (error) {
+        this.discoveryError = error.message.slice(0, 200);
+      }
+    });
+  }
+
+  announce() {
+    if (!this.discoverySocket || !this.port) return;
+    const message = Buffer.from(JSON.stringify(this.selfRecord()));
+    this.discoverySocket.send(message, this.discoveryPort, this.discoveryGroup, (error) => {
+      if (error) this.discoveryError = error.message.slice(0, 200);
+    });
+  }
+
+  observePeer(peer) {
+    const paired = this.state.peers.find((item) => item.nodeId === peer.nodeId);
+    if (paired) {
+      paired.name = peer.name;
+      paired.host = peer.host;
+      paired.port = peer.port;
+      paired.status = "online";
+      paired.lastSeen = new Date(peer.lastSeen).toISOString();
+      if (peer.capabilitiesAt >= (paired.capabilitiesAt || 0)) {
+        paired.capabilities = peer.capabilities;
+        paired.capabilitiesAt = peer.capabilitiesAt;
+      }
+      this.persist().catch(() => {});
+      return;
+    }
+    this.state.discovered = this.state.discovered.filter((item) =>
+      item.nodeId === peer.nodeId || item.host !== peer.host || item.port !== peer.port,
+    );
+    const index = this.state.discovered.findIndex((item) => item.nodeId === peer.nodeId);
+    if (index >= 0) {
+      const old = this.state.discovered[index];
+      if (peer.lastSeen < old.lastSeen) return;
+      this.state.discovered[index] = { ...old, ...peer };
+    } else {
+      this.state.discovered.push(peer);
+    }
+    this.state.discovered = this.state.discovered.slice(-MAX_HISTORY);
+  }
+
+  expirePeers() {
+    const now = Date.now();
+    this.state.discovered = this.state.discovered
+      .filter((peer) => now - peer.lastSeen <= PEER_KEEP_MS)
+      .map((peer) => ({
+        ...peer,
+        status: now - peer.lastSeen > PEER_TTL_MS ? "offline" : "online",
+      }));
+  }
+
+  async scan() {
+    const own = new Set(localAddresses());
+    const targets = new Set();
+    for (const address of localAddresses()) {
+      if (isIP(address) !== 4) continue;
+      const octets = address.split(".").map(Number);
+      const prefix = `${octets[0]}.${octets[1]}.${octets[2]}.`;
+      for (let host = 1; host < 255; host++) {
+        const candidate = `${prefix}${host}`;
+        if (!own.has(candidate)) targets.add(candidate);
+      }
+    }
+    const queue = [...targets];
+    let found = 0;
+    const worker = async () => {
+      while (queue.length) {
+        const host = queue.pop();
+        try {
+          const response = await fetch(`http://${host}:${DEFAULT_PEER_PORT}${API_PREFIX}/health`, {
+            signal: AbortSignal.timeout(800),
+          });
+          if (!response.ok) continue;
+          const record = await response.json();
+          const peerId = record.id || record.instanceId || record.nodeId;
+          const peerName = record.machine || record.name;
+          if (!["dsh-mesh", "copilot-plugin-mesh"].includes(record.app)
+            || typeof peerId !== "string"
+            || peerId === this.state.nodeId) continue;
+          this.observePeer({
+            nodeId: peerId,
+            name: typeof peerName === "string" ? peerName.slice(0, 32) : host,
+            host,
+            port: Number.isInteger(record.port) ? record.port : DEFAULT_PEER_PORT,
+            capabilities: sanitizeCapabilities(record.capabilities),
+            capabilitiesAt: Number.isFinite(record.capabilities?.capabilitiesAt) ? record.capabilities.capabilitiesAt : 0,
+            lastSeen: Date.now(),
+            paired: this.state.peers.some((peer) => peer.nodeId === peerId),
+          });
+          found += 1;
+        } catch {
+          continue;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(64, queue.length) }, () => worker()));
+    return { scanned: targets.size, found, peers: this.localState().discovered };
   }
 
   sendJson(response, status, value) {
@@ -208,11 +550,8 @@ export class MeshRuntime {
     if (request.method === "GET" && url.pathname === `${API_PREFIX}/health`) {
       this.sendJson(response, 200, {
         ok: true,
-        app: "copilot-plugin-mesh",
-        version: 1,
+        ...this.selfRecord(),
         nodeId: this.state.nodeId,
-        name: this.state.name,
-        port: this.port,
       });
       return;
     }
@@ -221,31 +560,52 @@ export class MeshRuntime {
       this.sendJson(response, 404, { ok: false, error: "Not found." });
       return;
     }
-    if (!isValidToken(request.headers["x-plugin-mesh-token"], this.state.token)) {
+    const requestToken = request.headers["x-dsh-mesh-token"] || request.headers["x-plugin-mesh-token"];
+    const paired = isValidToken(requestToken, this.state.token)
+      || this.state.peers.some((peer) => isValidToken(requestToken, peer.token));
+    if (request.method === "GET" && url.pathname === `${API_PREFIX}/hello`) {
+      this.sendJson(response, 200, {
+        ok: true,
+        ...this.selfRecord(),
+        nodeId: this.state.nodeId,
+        peerPaired: paired,
+        paired,
+        reviewOnly: true,
+      });
+      return;
+    }
+    if (!paired) {
       this.sendJson(response, 403, { ok: false, error: "Pairing token is missing or invalid." });
       return;
     }
 
-    if (request.method === "GET" && url.pathname === `${API_PREFIX}/hello`) {
+    if (request.method === "GET" && url.pathname === `${API_PREFIX}/peers`) {
       this.sendJson(response, 200, {
         ok: true,
-        nodeId: this.state.nodeId,
-        name: this.state.name,
-        paired: true,
-        app: "copilot-plugin-mesh",
-        version: 1,
+        peers: [
+          ...this.state.peers.map((peer) => ({ ...safePeer(peer), online: peer.status === "online" })),
+          ...this.state.discovered.map((peer) => ({
+            id: peer.nodeId,
+            nodeId: peer.nodeId,
+            machine: peer.name,
+            host: peer.host,
+            port: peer.port,
+            online: peer.status === "online",
+            paired: false,
+            capabilities: peer.capabilities ?? null,
+            capabilitiesAt: peer.capabilitiesAt ?? 0,
+          })),
+        ],
       });
       return;
     }
-    if (request.method === "GET" && url.pathname === `${API_PREFIX}/peers`) {
-      this.sendJson(response, 200, { ok: true, peers: this.state.peers.map(safePeer) });
-      return;
-    }
     if (request.method === "GET" && url.pathname === `${API_PREFIX}/tasks`) {
+      const tasks = this.state.inbox.slice(-50).reverse();
       this.sendJson(response, 200, {
         ok: true,
-        inbox: this.state.inbox.slice(-MAX_HISTORY).reverse(),
-        sent: this.state.sent.slice(-MAX_HISTORY).reverse(),
+        tasks,
+        inbox: tasks,
+        sent: this.state.sent.slice(-50).reverse(),
       });
       return;
     }
@@ -267,7 +627,7 @@ export class MeshRuntime {
         return;
       }
       if (Buffer.byteLength(body.task, "utf8") > MAX_TASK_LENGTH) {
-        this.sendJson(response, 413, { ok: false, error: "Task text exceeds 64 KiB." });
+        this.sendJson(response, 413, { ok: false, error: "Task text exceeds 256 KiB." });
         return;
       }
 
@@ -276,50 +636,93 @@ export class MeshRuntime {
         : randomBytes(12).toString("hex");
       const existing = this.state.inbox.find((item) => item.id === id);
       if (existing) {
-        this.sendJson(response, 202, { ok: true, id, duplicate: true, status: existing.status });
+        this.sendJson(response, 200, { ok: true, id, duplicate: true, status: existing.status });
         return;
       }
 
       const task = {
         id,
         fromNodeId: typeof body.fromNodeId === "string" ? body.fromNodeId.slice(0, 64) : "unknown",
-        fromName: typeof body.fromName === "string" ? body.fromName.slice(0, 64) : "Unknown peer",
+        from: typeof body.from === "string" ? body.from.slice(0, 128) : "",
+        fromName: typeof body.fromMachine === "string"
+          ? body.fromMachine.slice(0, 64)
+          : typeof body.fromName === "string" ? body.fromName.slice(0, 64) : "Unknown peer",
+        fromMachine: typeof body.fromMachine === "string" ? body.fromMachine.slice(0, 64) : null,
         task: body.task,
+        thread: typeof body.thread === "string" ? body.thread.slice(0, 128) : "",
+        originSession: typeof body.originSession === "string" ? body.originSession.slice(0, 128) : "",
+        noWake: body.noWake === true,
+        newSession: body.newSession === true,
+        workspace: typeof body.workspace === "string" ? body.workspace.slice(0, 512) : "",
         receivedAt: new Date().toISOString(),
+        sourceAddress: request.socket.remoteAddress || "",
+        transport: "lan",
         status: "awaiting-review",
+        routeDecision: "Stored for explicit user review; not injected into an agent session.",
+        dispatchError: "",
+        replyTo: {
+          machine: typeof body.fromMachine === "string" ? body.fromMachine.slice(0, 64) : "",
+          session: typeof body.originSession === "string" ? body.originSession.slice(0, 128) : "",
+          thread: typeof body.thread === "string" ? body.thread.slice(0, 128) : "",
+        },
       };
       this.state.inbox.push(task);
       this.state.inbox = this.state.inbox.slice(-MAX_HISTORY);
       await this.persist();
-      this.sendJson(response, 202, { ok: true, id, duplicate: false, status: task.status });
+      this.sendJson(response, 200, { ok: true, id, duplicate: false, status: task.status });
       return;
     }
     this.sendJson(response, 404, { ok: false, error: "Not found." });
   }
 
   localState({ includeToken = false } = {}) {
+    this.expirePeers();
     return {
       nodeId: this.state.nodeId,
       name: this.state.name,
       ...(includeToken ? { token: this.state.token } : {}),
       port: this.port,
       addresses: localAddresses(),
-      peers: this.state.peers.map(safePeer),
+      capabilities: this.capabilities,
+      discoveryError: this.discoveryError,
+      discovered: this.state.discovered.map((peer) => ({
+        nodeId: peer.nodeId,
+        name: peer.name,
+        host: peer.host,
+        port: peer.port,
+        status: peer.status,
+        lastSeen: peer.lastSeen,
+        capabilities: peer.capabilities,
+        capabilitiesStale: peer.capabilities === null || peer.capabilitiesAt <= 0
+          ? null
+          : Date.now() - peer.capabilitiesAt > 10 * 60_000,
+        paired: false,
+      })),
+      peers: this.state.peers.map((peer) => ({
+        ...safePeer(peer),
+        host: peer.host,
+        port: peer.port,
+        os: peer.os ?? "",
+        capabilities: peer.capabilities ?? null,
+        capabilitiesStale: peer.capabilities == null || peer.capabilitiesAt <= 0
+          ? null
+          : Date.now() - peer.capabilitiesAt > 10 * 60_000,
+      })),
       inbox: this.state.inbox.slice(-MAX_HISTORY).reverse(),
       sent: this.state.sent.slice(-MAX_HISTORY).reverse(),
     };
   }
 
   async addPeer({ name, url, token }) {
-    if (typeof name !== "string" || name.trim().length === 0 || name.length > 64) {
-      throw new Error("Peer name must contain 1–64 characters.");
+    if (!this.validName(name)) {
+      throw new Error("Peer name must be 1–32 characters and contain no slash or control characters.");
     }
-    if (typeof token !== "string" || !/^[A-Za-z0-9_-]{40,128}$/.test(token)) {
+    if (!isValidPairingToken(token)) {
       throw new Error("Peer pairing token must be a valid token copied from that peer.");
     }
     const normalizedUrl = normalizePeerUrl(url);
     const response = await fetch(`${normalizedUrl}${API_PREFIX}/hello`, {
-      headers: { "X-Plugin-Mesh-Token": token },
+      headers: { "X-Dsh-Mesh-Token": token },
       signal: AbortSignal.timeout(3000),
     });
     if (!response.ok) {
@@ -327,21 +730,31 @@ export class MeshRuntime {
       throw new Error(`Peer handshake failed (${response.status}).`);
     }
     const remote = await response.json();
-    if (!remote.ok || typeof remote.nodeId !== "string" || !/^[a-f0-9]{32}$/.test(remote.nodeId)) {
+    const remoteId = remote.id || remote.instanceId || remote.nodeId;
+    if (!remote.ok || typeof remoteId !== "string" || !/^[a-f0-9]{16,32}$/.test(remoteId)) {
       throw new Error("Peer returned an invalid handshake response.");
     }
-    const existing = this.state.peers.find((peer) => peer.nodeId === remote.nodeId || peer.url === normalizedUrl);
+    if (remote.peerPaired === false || remote.paired === false) {
+      throw new Error("The peer does not accept this pairing token.");
+    }
+    const existing = this.state.peers.find((peer) => peer.nodeId === remoteId || peer.url === normalizedUrl);
     const peer = {
-      id: remote.nodeId,
-      nodeId: remote.nodeId,
+      id: remoteId,
+      nodeId: remoteId,
       name: name.trim(),
       url: normalizedUrl,
+      host: new URL(normalizedUrl).hostname.replace(/^\[|\]$/g, ""),
+      port: Number(new URL(normalizedUrl).port) || DEFAULT_PEER_PORT,
       token,
+      os: typeof remote.os === "string" ? remote.os.slice(0, 96) : "",
+      capabilities: sanitizeCapabilities(remote.capabilities),
+      capabilitiesAt: Number.isFinite(remote.capabilities?.capabilitiesAt) ? remote.capabilities.capabilitiesAt : 0,
       status: "online",
       lastSeen: new Date().toISOString(),
     };
     if (existing) Object.assign(existing, peer);
     else this.state.peers.push(peer);
+    this.state.discovered = this.state.discovered.filter((item) => item.nodeId !== peer.nodeId);
     await this.persist();
     return safePeer(peer);
   }
@@ -350,7 +763,7 @@ export class MeshRuntime {
     const peer = this.state.peers.find((item) => item.id === id);
     if (!peer) throw new Error("Peer not found.");
     const response = await fetch(`${peer.url}${API_PREFIX}/hello`, {
-      headers: { "X-Plugin-Mesh-Token": peer.token },
+      headers: { "X-Dsh-Mesh-Token": peer.token },
       signal: AbortSignal.timeout(3000),
     });
     if (!response.ok) {
@@ -359,14 +772,31 @@ export class MeshRuntime {
       throw new Error(response.status === 403 ? "Peer no longer accepts this pairing token." : `Peer is unreachable (${response.status}).`);
     }
     const remote = await response.json();
-    if (!remote.ok || remote.nodeId !== peer.nodeId) {
+    if (!remote.ok || (remote.id || remote.instanceId || remote.nodeId) !== peer.nodeId) {
       peer.status = "identity-changed";
       await this.persist();
       throw new Error("Peer identity changed. Remove it and pair the new identity explicitly.");
     }
-    peer.name = typeof remote.name === "string" ? remote.name.slice(0, 64) : peer.name;
+    peer.name = typeof (remote.machine || remote.name) === "string" ? (remote.machine || remote.name).slice(0, 32) : peer.name;
+    peer.os = typeof remote.os === "string" ? remote.os.slice(0, 96) : peer.os;
+    if (Number.isFinite(remote.capabilities?.capabilitiesAt) && remote.capabilities.capabilitiesAt >= (peer.capabilitiesAt || 0)) {
+      peer.capabilities = sanitizeCapabilities(remote.capabilities);
+      peer.capabilitiesAt = remote.capabilities.capabilitiesAt;
+    }
+    peer.host = new URL(peer.url).hostname.replace(/^\[|\]$/g, "");
+    peer.port = Number(new URL(peer.url).port) || DEFAULT_PEER_PORT;
     peer.status = "online";
     peer.lastSeen = new Date().toISOString();
+    this.observePeer({
+      nodeId: peer.nodeId,
+      name: peer.name,
+      host: peer.host,
+      port: peer.port,
+      capabilities: peer.capabilities,
+      capabilitiesAt: peer.capabilitiesAt || 0,
+      lastSeen: Date.now(),
+      paired: true,
+    });
     await this.persist();
     return safePeer(peer);
   }
@@ -379,11 +809,12 @@ export class MeshRuntime {
     return { removed: true, id };
   }
 
-  async sendTask({ peerId, task }) {
+  async sendTask({ peerId, task, thread = "" }) {
     const peer = this.state.peers.find((item) => item.id === peerId);
     if (!peer) throw new Error("Peer not found. Add and pair it first.");
     if (typeof task !== "string" || task.trim().length === 0) throw new Error("Task text is required.");
-    if (Buffer.byteLength(task, "utf8") > MAX_TASK_LENGTH) throw new Error("Task text exceeds 64 KiB.");
+    if (Buffer.byteLength(task, "utf8") > MAX_TASK_LENGTH) throw new Error("Task text exceeds 256 KiB.");
+    if (typeof thread !== "string" || thread.length > 128) throw new Error("Thread must be at most 128 characters.");
 
     const id = `t-${randomBytes(12).toString("hex")}`;
     const record = {
@@ -391,6 +822,7 @@ export class MeshRuntime {
       peerId: peer.id,
       peerName: peer.name,
       task,
+      thread,
       sentAt: new Date().toISOString(),
       status: "sending",
     };
@@ -403,19 +835,25 @@ export class MeshRuntime {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Plugin-Mesh-Token": peer.token,
+          "X-Dsh-Mesh-Token": peer.token,
         },
         body: JSON.stringify({
           id,
           fromNodeId: this.state.nodeId,
           fromName: this.state.name,
+          fromMachine: this.state.name,
+          from: this.state.name,
+          thread: thread || undefined,
+          noWake: true,
           task,
         }),
         signal: AbortSignal.timeout(8000),
       });
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || `Peer rejected the task (${response.status}).`);
-      record.status = result.duplicate ? "already-received" : "accepted-for-review";
+      record.status = result.duplicate
+        ? "already-received"
+        : ["awaiting-review", "noted-only"].includes(result.status) ? "accepted-for-review" : "accepted";
       record.response = result.status;
       peer.status = "online";
       peer.lastSeen = new Date().toISOString();
@@ -424,7 +862,7 @@ export class MeshRuntime {
         accepted: true,
         id,
         status: record.status,
-        message: "Delivered to the peer's review inbox; acceptance does not mean the task was executed.",
+        message: "Delivered as a no-wake task request; acceptance does not mean the task was executed.",
       };
     } catch (error) {
       record.status = "failed";
@@ -444,10 +882,20 @@ export class MeshRuntime {
   }
 }
 
-export function createMeshRuntime({ copilotHome = process.env.COPILOT_HOME || resolve(homedir(), ".copilot"), port, host } = {}) {
+export function createMeshRuntime({
+  copilotHome = process.env.COPILOT_HOME || resolve(homedir(), ".copilot"),
+  port,
+  host,
+  discovery,
+  discoveryGroup,
+  discoveryPort,
+} = {}) {
   return new MeshRuntime({
     storageFile: resolve(copilotHome, "extensions", "plugin-mesh", "artifacts", "mesh-state.json"),
     ...(port === undefined ? {} : { port }),
     ...(host === undefined ? {} : { host }),
+    ...(discovery === undefined ? {} : { discovery }),
+    ...(discoveryGroup === undefined ? {} : { discoveryGroup }),
+    ...(discoveryPort === undefined ? {} : { discoveryPort }),
   });
 }
