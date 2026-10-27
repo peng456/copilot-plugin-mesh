@@ -1,0 +1,4 @@
+node_modules/
+.copilot/
+.DS_Store
+*.log
