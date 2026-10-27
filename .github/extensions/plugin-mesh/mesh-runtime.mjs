@@ -70,7 +70,8 @@ function localAddresses() {
   const addresses = [];
   for (const entries of Object.values(networkInterfaces())) {
     for (const entry of entries ?? []) {
-      if (!entry.internal && isPrivateAddress(entry.address)) addresses.push(entry.address);
+      const linkLocalIpv6 = isIP(entry.address) === 6 && entry.address.toLowerCase().startsWith("fe80:");
+      if (!entry.internal && !linkLocalIpv6 && isPrivateAddress(entry.address)) addresses.push(entry.address);
     }
   }
   return [...new Set(addresses)];
