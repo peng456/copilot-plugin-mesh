@@ -542,6 +542,8 @@ function renderHtml() {
             status.className = "task-status";
             status.textContent = task.status + " · " + (task.receivedAt || task.sentAt || "");
             if (task.noWake === true) status.textContent += " · noWake";
+            if (inbox && task.isReply === true) status.textContent += " · 回复";
+            if (!inbox && task.repliedAt) status.textContent += " · 已回复";
             if (task.thread) status.textContent += " · thread " + task.thread;
             head.append(title, status);
             const body = document.createElement("pre");
@@ -989,7 +991,7 @@ extensionSession = await joinSession({
   canvases: [pluginMeshCanvas],
   hooks: {
     onSessionStart: async () => ({
-      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically, but control and outbound task dispatch require manual pairing. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions keep tools available by default, matching DSH's workspace-write permission preset; set COPILOT_MESH_TASK_TOOLS=none to run them without tools. A completed task is returned to the sender once as a noWake notice, and a receipt is never answered again. noWake, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
+      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically, but control and outbound task dispatch require manual pairing. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions keep tools available by default, matching DSH's workspace-write permission preset; set COPILOT_MESH_TASK_TOOLS=none to run them without tools. A completed task is returned to the sender once as a noWake notice, and a receipt is never answered again. An answer that matches an outbound task of ours overrides that noWake so the reply does reach an agent; unmatched noWake notices, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
     }),
     onSessionEnd: async () => {
       if (meshListenRetryTimer) clearInterval(meshListenRetryTimer);

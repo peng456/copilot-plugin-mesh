@@ -988,12 +988,19 @@ export class MeshRuntime {
 
   prepareIncomingTask(task, requestAddress) {
     const text = task.task.trim();
-    if (task.noWake) {
+    // A matched reply is the answer to a task we sent, so it has to reach an
+    // agent. Replies always travel with noWake (see deliverReply) and are often
+    // terse, so without this override every answer would be filed as a notice
+    // and silently never read. Loops stay impossible because deliverReply
+    // refuses to answer anything already marked as a reply.
+    const isReply = task.isReply === true;
+    if (isReply && task.noWake) task.wakeOverride = "noWake";
+    if (task.noWake && !isReply) {
       task.status = "noted-only";
       task.routeDecision = "The sender requested noWake; the task is stored without creating a session.";
       return;
     }
-    if ([...text].length < MIN_TASK_CHARS || NOTICE_ONLY_PATTERN.test(text)) {
+    if (!isReply && ([...text].length < MIN_TASK_CHARS || NOTICE_ONLY_PATTERN.test(text))) {
       task.status = "noted-only";
       task.routeDecision = "Short or notice-only message; no session was created.";
       return;
@@ -1042,18 +1049,37 @@ export class MeshRuntime {
     task.threadKey = threadKey;
     task.createSession = createSession;
     task.status = "dispatching";
-    task.routeDecision = "Queued in an isolated task session.";
+    task.routeDecision = isReply
+      ? `Queued in an isolated task session as the answer to ${task.replyToTaskId}${task.noWake ? " (noWake overridden)" : ""}.`
+      : "Queued in an isolated task session.";
   }
 
   // dsh-plugin-mesh treats a message as a receipt when it already dispatched an
   // outbound task to the same machine on the same thread. Receipts must never be
   // answered again, or two peers ping-pong forever.
   markReply(task) {
-    if (!task.thread) return;
     const from = task.fromMachine || String(task.from || "").split("/")[0] || "";
-    task.isReply = this.state.sent.some((entry) =>
-      String(entry.peerName || "") === from && String(entry.thread || "") === String(task.thread),
-    );
+    if (!from) return;
+    const thread = String(task.thread || "");
+    // The newest unanswered outbound task on this thread is the one being
+    // answered. Threadless tasks are matched too, otherwise their answers can
+    // never be recognised as receipts.
+    let answered = null;
+    for (let index = this.state.sent.length - 1; index >= 0; index -= 1) {
+      const entry = this.state.sent[index];
+      if (entry.repliedAt) continue;
+      if (String(entry.thread || "") !== thread) continue;
+      if (String(entry.peerName || "") !== from) continue;
+      answered = entry;
+      break;
+    }
+    task.isReply = answered !== null;
+    task.replyToTaskId = answered ? answered.id : null;
+    if (answered) {
+      // Keep the delivery status intact; the answer is recorded alongside it.
+      answered.repliedAt = new Date().toISOString();
+      answered.replyTaskId = task.id;
+    }
   }
 
   // dsh-plugin-mesh resolves a reply by machine name from its peer table, but
@@ -1138,8 +1164,10 @@ export class MeshRuntime {
       return;
     }
     const host = target.host.includes(":") ? `[${target.host}]` : target.host;
-    // noWake keeps the answer a notice on the peer, so replies cannot ping-pong
-    // back into another session.
+    // noWake marks the answer as a notice so it cannot create a session on a
+    // peer that never asked for one. A peer that did ask matches it against its
+    // own outbound task and overrides noWake (see prepareIncomingTask); loops
+    // stay impossible because the isReply guard above refuses to answer twice.
     const body = {
       id: `${task.id}:reply`,
       task: task.result.slice(0, MAX_TASK_LENGTH),

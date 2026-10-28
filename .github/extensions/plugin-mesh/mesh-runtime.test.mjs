@@ -487,6 +487,161 @@ test("an answer to our own outbound task is treated as a receipt and not answere
   );
 });
 
+test("an answer to our own outbound task wakes an agent even though replies travel with noWake", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
+  const receiver = createMeshRuntime({
+    copilotHome: resolve(home, "receiver"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-answer";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `received ${task.id}` };
+    },
+  });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  const receiverPort = await receiver.listen();
+
+  // deliverReply always marks an answer noWake so it cannot wake a peer that
+  // never asked. The peer that did ask must still read the answer, even when it
+  // is too terse to pass the notice filter.
+  receiver.state.sent.push({ id: "t-out", peerName: "sender-node", thread: "answer-thread", noWake: false });
+
+  await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "answer-1",
+      task: "收到",
+      thread: "answer-thread",
+      fromMachine: "sender-node",
+      fromPort: senderPort,
+      noWake: true,
+    }),
+  });
+
+  let task;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    task = receiver.state.inbox.find((entry) => entry.id === "answer-1");
+    if (task?.status === "completed" && task.replyStatus) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(task.isReply, true);
+  assert.equal(task.replyToTaskId, "t-out");
+  assert.equal(task.status, "completed");
+  assert.equal(task.wakeOverride, "noWake");
+  assert.equal(task.replyStatus, "skipped-reply");
+  assert.equal(receiver.state.sent.find((entry) => entry.id === "t-out").repliedAt !== undefined, true);
+  assert.equal(
+    sender.localState().inbox.find((entry) => entry.id === "answer-1:reply"),
+    undefined,
+    "an answer must not be answered again",
+  );
+});
+
+test("a second answer on an answered thread is only a notice", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const receiver = createMeshRuntime({
+    copilotHome: home,
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-answer";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `received ${task.id}` };
+    },
+  });
+  t.after(async () => {
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await receiver.initialize();
+  const receiverPort = await receiver.listen();
+  receiver.state.sent.push({ id: "t-out", peerName: "sender-node", thread: "answer-thread", noWake: false });
+
+  const post = (id) => fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id,
+      task: "Here is the answer you asked for.",
+      thread: "answer-thread",
+      fromMachine: "sender-node",
+      noWake: true,
+    }),
+  });
+
+  await post("answer-1");
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (receiver.state.inbox.find((entry) => entry.id === "answer-1")?.status === "completed") break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  await post("answer-2");
+
+  const first = receiver.state.inbox.find((entry) => entry.id === "answer-1");
+  const second = receiver.state.inbox.find((entry) => entry.id === "answer-2");
+  assert.equal(first.isReply, true);
+  assert.equal(second.isReply, false);
+  assert.equal(second.status, "noted-only");
+  assert.equal(second.routeDecision, "The sender requested noWake; the task is stored without creating a session.");
+});
+
+test("an answer to a threadless outbound task is still recognised as a receipt", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const receiver = createMeshRuntime({
+    copilotHome: home,
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-answer";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `received ${task.id}` };
+    },
+  });
+  t.after(async () => {
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await receiver.initialize();
+  const receiverPort = await receiver.listen();
+  receiver.state.sent.push({ id: "t-threadless", peerName: "sender-node", noWake: false });
+
+  await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "answer-1",
+      task: "Here is the answer you asked for.",
+      fromMachine: "sender-node",
+      noWake: true,
+    }),
+  });
+
+  let task;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    task = receiver.state.inbox.find((entry) => entry.id === "answer-1");
+    if (task?.status === "completed" && task.replyStatus) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(task.isReply, true);
+  assert.equal(task.replyToTaskId, "t-threadless");
+  assert.equal(task.status, "completed");
+});
+
 test("a reply reaches a sender that does not announce a port", async (t) => {
   const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
   const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
