@@ -752,6 +752,7 @@ export class MeshRuntime {
             : null,
         },
       };
+      this.markReply(task);
       this.prepareIncomingTask(task, requestAddress);
       this.state.inbox.push(task);
       this.state.inbox = this.state.inbox.slice(-MAX_HISTORY);
@@ -1031,9 +1032,18 @@ export class MeshRuntime {
     task.threadKey = threadKey;
     task.createSession = createSession;
     task.status = "dispatching";
-    task.routeDecision = task.authenticated
-      ? "Queued in an isolated task session with tools enabled."
-      : "Queued in an isolated task session with tools disabled.";
+    task.routeDecision = "Queued in an isolated task session.";
+  }
+
+  // dsh-plugin-mesh treats a message as a receipt when it already dispatched an
+  // outbound task to the same machine on the same thread. Receipts must never be
+  // answered again, or two peers ping-pong forever.
+  markReply(task) {
+    if (!task.thread) return;
+    const from = task.fromMachine || String(task.from || "").split("/")[0] || "";
+    task.isReply = this.state.sent.some((entry) =>
+      String(entry.peerName || "") === from && String(entry.thread || "") === String(task.thread),
+    );
   }
 
   replyTarget(task) {
@@ -1049,6 +1059,10 @@ export class MeshRuntime {
 
   async deliverReply(task) {
     if (typeof task.result !== "string" || task.result.length === 0) return;
+    if (task.isReply === true) {
+      task.replyStatus = "skipped-reply";
+      return;
+    }
     const target = this.replyTarget(task);
     if (!target) {
       task.replyStatus = "no-route";
@@ -1125,7 +1139,7 @@ export class MeshRuntime {
       task.status = "completed";
       task.routeDecision = task.toolPolicy === "all"
         ? "Completed in an isolated task session with tools enabled."
-        : "Completed in an isolated task session with tools disabled. Pair the peer to let it use tools.";
+        : "Completed in an isolated task session with tools disabled (COPILOT_MESH_TASK_TOOLS).";
       if (route) route.lastUsedAt = this.now();
       await this.deliverReply(task);
     } catch (error) {

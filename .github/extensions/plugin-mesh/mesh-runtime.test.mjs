@@ -430,3 +430,59 @@ test("a reply without a routable sender is recorded but not sent", async (t) => 
   assert.equal(task.status, "completed");
   assert.equal(task.replyStatus, "no-route");
 });
+
+test("an answer to our own outbound task is treated as a receipt and not answered", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
+  const receiver = createMeshRuntime({
+    copilotHome: resolve(home, "receiver"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-receipt";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `Answer for ${task.id}` };
+    },
+  });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  const receiverPort = await receiver.listen();
+
+  // The receiver already dispatched a task to this machine on this thread, so
+  // the same thread coming back is the answer, not a new request.
+  receiver.state.sent.push({ id: "t-out", peerName: "sender-node", thread: "loop-thread", noWake: false });
+
+  await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "loop-1",
+      task: "Here is the answer to the question you asked me.",
+      thread: "loop-thread",
+      fromMachine: "sender-node",
+      fromPort: senderPort,
+    }),
+  });
+
+  let task;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    task = receiver.state.inbox.find((entry) => entry.id === "loop-1");
+    if (task?.status === "completed" && task.replyStatus) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(task.isReply, true);
+  assert.equal(task.replyStatus, "skipped-reply");
+  assert.equal(
+    sender.localState().inbox.find((entry) => entry.id === "loop-1:reply"),
+    undefined,
+    "a receipt must not be answered again",
+  );
+});

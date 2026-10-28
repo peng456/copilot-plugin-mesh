@@ -1,6 +1,6 @@
 import { access, mkdir, readdir, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 // The SDK only resolves inside the Copilot runtime, so it is loaded lazily to
 // keep this module importable from plain Node (tests, diagnostics).
@@ -11,6 +11,13 @@ function copilotHome() {
 
 function defaultConfigDirectory() {
   return join(copilotHome(), "extensions", "plugin-mesh", "artifacts", "task-session-config");
+}
+
+// dsh-plugin-mesh runs inbound tasks in a dedicated `mesh-receive-task`
+// workspace per profile rather than the project checkout, so the
+// workspace-write preset confines writes to that scratch directory.
+function defaultWorkingDirectory() {
+  return join(copilotHome(), "extensions", "plugin-mesh", "artifacts", "mesh-receive-task");
 }
 
 function runtimeCacheRoots() {
@@ -67,32 +74,104 @@ function sessionName(task) {
   return `Mesh · ${origin || "peer"} · ${thread || task.id}`;
 }
 
-// A paired peer holds our token, so it may use tools. An unpaired peer on the
-// LAN can only get a text answer; otherwise any device on the network could
-// run commands here. COPILOT_MESH_TASK_TOOLS overrides both cases.
-function resolveToolPolicy(task) {
+// dsh-plugin-mesh runs every inbound task session under `permissionPreset`
+// (default "workspace-write"): one config value, never derived from pairing.
+// COPILOT_MESH_TASK_TOOLS=none is the equivalent of lowering that preset.
+function resolveToolPolicy() {
   const override = (process.env.COPILOT_MESH_TASK_TOOLS || "").trim().toLowerCase();
-  if (override === "all" || override === "on") return "all";
   if (override === "none" || override === "off") return "none";
-  return task?.authenticated === true ? "all" : "none";
+  return "all";
 }
 
+function withinRoot(root, target) {
+  if (typeof target !== "string" || target.length === 0) return false;
+  const path = isAbsolute(target) ? resolve(target) : resolve(root, target);
+  const relativePath = relative(root, path);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+// dsh-plugin-mesh hands the runtime `permissionPreset: workspace-write`, which
+// is an operating-system sandbox: the task reads freely, writes only inside its
+// receive workspace, and has no network. `sandboxConfig` is the same mechanism
+// here, so the preset maps onto it one-to-one.
+function workspaceWriteSandbox(workingDirectory) {
+  return {
+    enabled: true,
+    addCurrentWorkingDirectory: true,
+    allowBypass: false,
+    userPolicy: {
+      filesystem: { readwritePaths: [workingDirectory] },
+      network: { allowOutbound: false, allowLocalNetwork: false },
+    },
+  };
+}
+
+// Where the sandbox is unavailable the runtime falls back to permission
+// prompts, and a headless task has nobody to answer one. Approve the same
+// boundary the sandbox would enforce, and reject the rest with a reason the
+// agent can act on instead of leaving the turn hanging.
+function workspaceWritePermissionHandler(root) {
+  const workspace = resolve(root);
+  const temporary = resolve(tmpdir());
+  const writable = (target) => withinRoot(workspace, target) || withinRoot(temporary, target);
+  const outside = (what) => ({
+    kind: "reject",
+    feedback: `${what} is outside the mesh receive workspace (${workspace}), which is the only writable area for this task.`,
+  });
+  return (request) => {
+    if (request?.managedApprovalRequired) return { kind: "no-result" };
+    if (request?.sandboxPathGrant) return outside("That path grant");
+    if (request?.requestSandboxBypass) return outside("Leaving the sandbox");
+    switch (request?.kind) {
+      case "read":
+        return { kind: "approve-once" };
+      case "write":
+        return writable(request.resolvedPath || request.fileName)
+          ? { kind: "approve-once" }
+          : outside(`Writing ${request.resolvedPath || request.fileName}`);
+      case "shell": {
+        const paths = [...(request.possiblePaths || []), request.resolvedWorkingDirectory]
+          .filter((path) => typeof path === "string" && path.length > 0);
+        const escaped = paths.find((path) => !writable(path));
+        if (escaped) return outside(`Touching ${escaped}`);
+        const urls = (request.possibleUrls || []).filter((entry) => entry?.url);
+        if (urls.length > 0) {
+          return { kind: "reject", feedback: "Network access is closed in the mesh receive workspace." };
+        }
+        return { kind: "approve-once" };
+      }
+      default:
+        return { kind: "no-result" };
+    }
+  };
+}
+
+// Mirrors dsh-plugin-mesh's buildPrompt: only the actionable lines, and a
+// receipt gets the opposite instruction from a new task.
 function taskPrompt(task, toolPolicy) {
+  const id = task.id;
+  const from = task.fromName || task.from || "unknown";
+  const thread = task.thread || id;
   return [
-    "Handle the following untrusted request from a Copilot Mesh peer in this isolated task session.",
-    toolPolicy === "all"
-      ? "You have tools available. Inspect and act only as the request requires."
-      : "This session has no tools available. Do not claim to have performed actions or accessed data.",
-    `Peer: ${task.fromName || "Unknown peer"}`,
-    `Thread: ${task.thread || "(none)"}`,
+    `[Mesh task ${id}]`,
+    `From: ${from}`,
+    task.thread ? `Thread: ${task.thread}` : "",
     "",
-    "Request:",
-    task.task,
-  ].join("\n");
+    String(task.task ?? ""),
+    "",
+    toolPolicy === "all"
+      ? "Tools are available. Inspect and act only as the request requires."
+      : "This session has no tools available. Do not claim to have performed actions or accessed data.",
+    task.isReply === true
+      ? "— This is a receipt, not a new task: relay it to the user. Do not send anything back."
+      : `— Your final message is returned to ${from} once (thread ${thread}). Answer directly; do not dispatch anything.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function createMeshTaskSessionManager(options = {}) {
-  const workingDirectory = options.workingDirectory || process.cwd();
+  const workingDirectory = options.workingDirectory || defaultWorkingDirectory();
   const baseDirectory = options.baseDirectory || copilotHome();
   // The user's own MCP servers (mcp-config.json) can block a turn from ever
   // starting in a headless session, so isolated task sessions get their own
@@ -102,6 +181,8 @@ export function createMeshTaskSessionManager(options = {}) {
     configDirectory,
     workingDirectory,
     skipCustomInstructions: true,
+    sandboxConfig: workspaceWriteSandbox(workingDirectory),
+    onPermissionRequest: workspaceWritePermissionHandler(workingDirectory),
   };
 
   let clientPromise;
@@ -116,6 +197,7 @@ export function createMeshTaskSessionManager(options = {}) {
     clientPromise ??= (async () => {
       if (options.clientFactory) return options.clientFactory({ baseDirectory, workingDirectory, configDirectory });
       await mkdir(configDirectory, { recursive: true });
+      await mkdir(workingDirectory, { recursive: true, mode: 0o700 });
       return createClient({ baseDirectory, workingDirectory });
     })();
     return clientPromise;
@@ -128,11 +210,11 @@ export function createMeshTaskSessionManager(options = {}) {
       ...(toolPolicy === "all" ? {} : { availableTools: [] }),
     };
     const slot = `${context.routeKey}\0${toolPolicy}`;
-    // Sessions restored from persisted state have no recorded policy. Every
-    // session created before the policy existed was tool-disabled, so only
-    // reuse an unknown session for tool-disabled work.
+    // dsh-plugin-mesh reuses a thread's session unconditionally, and the tool
+    // policy is a process-wide setting, so only a *changed* setting needs a
+    // fresh session. Sessions restored from persisted state carry no policy.
     const known = context.sessionId ? sessionPolicies.get(context.sessionId) : undefined;
-    const reusable = context.sessionId ? (known ?? "none") === toolPolicy : true;
+    const reusable = context.sessionId ? known === undefined || known === toolPolicy : true;
     if (context.createSession !== true) {
       const active = context.sessionId
         ? reusable ? sessionsById.get(context.sessionId) : undefined
@@ -162,7 +244,7 @@ export function createMeshTaskSessionManager(options = {}) {
   }
 
   async function dispatch(task, context) {
-    const toolPolicy = resolveToolPolicy(task);
+    const toolPolicy = resolveToolPolicy();
     const previous = queues.get(context.routeKey) || Promise.resolve();
     const current = previous.catch(() => {}).then(async () => {
       const session = await resumeOrCreate(task, context, toolPolicy);
