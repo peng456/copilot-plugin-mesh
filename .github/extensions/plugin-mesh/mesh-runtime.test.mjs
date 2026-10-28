@@ -856,3 +856,67 @@ test("the pairing switch closes the unauthenticated task door but keeps token di
 
   await assert.rejects(runtime.setRequirePairing("yes"), /must be a boolean/);
 });
+
+test("a noWake receipt that reuses our task ID as its thread still wakes the sender", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const dispatches = [];
+  const sender = createMeshRuntime({
+    copilotHome: resolve(home, "sender"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task) => {
+      dispatches.push(task.id);
+      return { sessionId: "session-receipt", result: "Handled the receipt.", toolPolicy: "all" };
+    },
+  });
+  const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  const receiverPort = await receiver.listen();
+  const peer = await sender.addPeer({
+    name: "dsh style node",
+    url: `http://127.0.0.1:${receiverPort}`,
+    token: receiver.localState({ includeToken: true }).token,
+  });
+
+  // Threadless dispatch, exactly like the canvas default.
+  const sent = await sender.sendTask({ peerId: peer.id, task: "Report the free disk space on this machine." });
+  const outbound = sender.localState().sent.at(-1);
+  assert.equal(outbound.thread, "");
+
+  // dsh replies with noWake and uses the peer's task ID as the thread fallback.
+  const reply = await fetch(`http://127.0.0.1:${senderPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: `${sent.id}:reply`,
+      fromName: "dsh style node",
+      fromMachine: "dsh style node",
+      thread: sent.id,
+      noWake: true,
+      task: "df -h /data: 37G available out of 228G.",
+    }),
+  });
+  assert.equal(reply.status, 200);
+  assert.equal((await reply.json()).status, "dispatching");
+
+  for (let attempt = 0; attempt < 50 && dispatches.length === 0; attempt += 1) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  assert.deepEqual(dispatches, [`${sent.id}:reply`]);
+
+  const receipt = sender.localState().inbox.find((entry) => entry.id === `${sent.id}:reply`);
+  assert.equal(receipt.status, "completed");
+  // isReply wins over the noWake flag, so the receipt still wakes us.
+  assert.equal(receipt.wakeOverride, "noWake");
+  assert.equal(receipt.replyToTaskId, sent.id);
+  assert.ok(sender.localState().sent.at(-1).repliedAt);
+});

@@ -283,7 +283,7 @@ function renderHtml() {
             <form id="task-form">
               <div class="field"><label for="task-peer">目标节点</label><select id="task-peer" required></select></div>
               <div class="field"><label for="task-thread">线程标签（可选）</label><input id="task-thread" maxlength="128" placeholder="用于关联同一件事的后续请求" /></div>
-              <div class="field"><label for="task-text">任务请求</label><textarea id="task-text" maxlength="262144" required placeholder="写下你希望对端隔离任务会话处理的请求…"></textarea></div>
+              <div class="field"><label for="task-text">任务请求</label><textarea id="task-text" maxlength="262144" required placeholder="写下你希望对端隔离任务会话处理的请求…"></textarea><p class="capability-note" id="task-wake-hint"></p></div>
               <label class="checkbox-field" for="task-no-wake"><input id="task-no-wake" type="checkbox" /><span>仅记录在对端收件箱，不唤醒 agent（noWake）</span></label>
               <div class="mesh-banner">默认按 DSH Mesh 协议发送普通任务；对端策略可能会唤醒 agent 或创建会话。只向你信任的节点派发。勾选 noWake 可要求对端仅记录。</div>
               <div class="actions"><button type="submit">发送任务</button><span class="hint">送达不代表任务已完成。</span></div>
@@ -660,6 +660,18 @@ function renderHtml() {
             setMeshFeedback(error.message, true);
           }
         });
+        // dsh-plugin-mesh files anything shorter than minTaskChars (default 8) as
+        // a notice and never wakes an agent, so say so before the user sends.
+        function updateWakeHint() {
+          const text = document.getElementById("task-text").value.trim();
+          const hint = document.getElementById("task-wake-hint");
+          const tooShort = text.length > 0 && text.length < 8;
+          hint.textContent = tooShort
+            ? "正文仅 " + text.length + " 字符：对端默认把少于 8 字符的内容当作通知，只存收件箱、不唤醒 agent。"
+            : "";
+        }
+
+        document.getElementById("task-text").addEventListener("input", updateWakeHint);
         document.getElementById("task-form").addEventListener("submit", async (event) => {
           event.preventDefault();
           try {
@@ -670,6 +682,7 @@ function renderHtml() {
               noWake: document.getElementById("task-no-wake").checked
             });
             document.getElementById("task-text").value = "";
+            updateWakeHint();
             await loadMesh();
             setMeshFeedback(result.message);
           } catch (error) {

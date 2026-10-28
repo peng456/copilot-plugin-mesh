@@ -1121,7 +1121,11 @@ export class MeshRuntime {
     for (let index = this.state.sent.length - 1; index >= 0; index -= 1) {
       const entry = this.state.sent[index];
       if (entry.repliedAt) continue;
-      if (String(entry.thread || "") !== thread) continue;
+      // dsh-plugin-mesh falls back to the task ID as the thread when the sender
+      // supplies none (`lib/index.js`: the receipt's thread is the peer's task
+      // ID). Our outbound thread is empty in that case, so matching only on
+      // thread equality would file every such answer as an unread notice.
+      if (String(entry.thread || "") !== thread && entry.id !== thread) continue;
       if (String(entry.peerName || "") !== from) continue;
       answered = entry;
       break;
