@@ -11,6 +11,8 @@ Copilot CLI adaptation of the node discovery, capability-card, pairing, peer hea
 - Mesh canvas for discovered/paired peers, explicit pairing, task dispatch, inbox review, and sent/received history.
 - DSH-style inbound routing: `noWake`, short/notice filtering, per-thread session reuse, a 5-second new-session cooldown, and a 30-wake/hour thread limit.
 - Normal inbound requests are handled in separate named Copilot sessions, not injected into the current conversation.
+- A completed task is posted back to the sender as a `noWake` notice, so the peer receives the answer without starting another session and replies cannot loop.
+- Task sessions from paired peers run with tools enabled; tasks from unpaired LAN peers stay tool-free. `COPILOT_MESH_TASK_TOOLS=all|none` forces one policy.
 - Read-only agent-facing canvas actions: `mesh_status`, `mesh_peers`, and `mesh_tasks`. Peer pairing, scanning, task sending, copying, and dismissing stay user-driven canvas actions.
 - Local plugin registry and sequential invocation (`echo`, `time`, `uppercase`, `ping`).
 

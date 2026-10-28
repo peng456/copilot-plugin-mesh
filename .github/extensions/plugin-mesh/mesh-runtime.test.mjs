@@ -339,3 +339,94 @@ test("discovered peers stay online between full LAN scans", async (t) => {
   await remote.close();
   assert.equal(await local.probeDiscoveredPeer(local.state.discovered[0]), false);
 });
+
+test("a completed task is delivered back to the sender as a noWake notice", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
+  const receiver = createMeshRuntime({
+    copilotHome: resolve(home, "receiver"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-reply";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `Answer for ${task.id}`, toolPolicy: "none" };
+    },
+  });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  const receiverPort = await receiver.listen();
+
+  const response = await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "reply-1",
+      task: "How is the machine doing right now?",
+      thread: "reply-thread",
+      fromMachine: "sender-node",
+      fromPort: senderPort,
+    }),
+  });
+  assert.equal((await response.json()).status, "dispatching");
+
+  let task;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    task = receiver.localState().inbox.find((entry) => entry.id === "reply-1");
+    if (task?.status === "completed" && task.replyStatus) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(task.status, "completed");
+  assert.equal(task.replyStatus, "delivered");
+
+  const delivered = sender.localState().inbox.find((entry) => entry.id === "reply-1:reply");
+  assert.ok(delivered, "sender should receive the answer");
+  assert.equal(delivered.task, "Answer for reply-1");
+  assert.equal(delivered.status, "noted-only");
+  assert.equal(delivered.noWake, true);
+  assert.equal(delivered.fromMachine, receiver.localState().name);
+});
+
+test("a reply without a routable sender is recorded but not sent", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const receiver = createMeshRuntime({
+    copilotHome: home,
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-solo";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: "solo answer" };
+    },
+  });
+  t.after(async () => {
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await receiver.initialize();
+  const port = await receiver.listen();
+  await fetch(`http://127.0.0.1:${port}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: "solo-1", task: "Any answer will do here.", thread: "solo" }),
+  });
+
+  let task;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    task = receiver.localState().inbox.find((entry) => entry.id === "solo-1");
+    if (task?.status === "completed" && task.replyStatus) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(task.status, "completed");
+  assert.equal(task.replyStatus, "no-route");
+});

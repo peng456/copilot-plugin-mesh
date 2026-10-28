@@ -746,6 +746,10 @@ export class MeshRuntime {
           machine: typeof body.fromMachine === "string" ? body.fromMachine.slice(0, 64) : "",
           session: typeof body.originSession === "string" ? body.originSession.slice(0, 128) : "",
           thread: typeof body.thread === "string" ? body.thread.slice(0, 128) : "",
+          host: requestAddress,
+          port: Number.isInteger(body.fromPort) && body.fromPort > 0 && body.fromPort <= 65535
+            ? body.fromPort
+            : null,
         },
       };
       this.prepareIncomingTask(task, requestAddress);
@@ -929,6 +933,7 @@ export class MeshRuntime {
           fromName: this.state.name,
           fromMachine: this.state.name,
           from: this.state.name,
+          fromPort: this.port,
           thread: thread || undefined,
           noWake,
           task,
@@ -1031,6 +1036,54 @@ export class MeshRuntime {
       : "Queued in an isolated task session with tools disabled.";
   }
 
+  replyTarget(task) {
+    const host = task.replyTo?.host;
+    if (typeof host !== "string" || !isPrivateAddress(host)) return null;
+    if (Number.isInteger(task.replyTo.port) && task.replyTo.port > 0) {
+      return { host, port: task.replyTo.port };
+    }
+    const known = [...this.state.peers, ...this.state.discovered]
+      .find((peer) => peer.host === host && Number.isInteger(peer.port));
+    return known ? { host, port: known.port } : null;
+  }
+
+  async deliverReply(task) {
+    if (typeof task.result !== "string" || task.result.length === 0) return;
+    const target = this.replyTarget(task);
+    if (!target) {
+      task.replyStatus = "no-route";
+      return;
+    }
+    const host = target.host.includes(":") ? `[${target.host}]` : target.host;
+    // noWake keeps the answer a notice on the peer, so replies cannot ping-pong
+    // back into another session.
+    const body = {
+      id: `${task.id}:reply`,
+      task: task.result.slice(0, MAX_TASK_LENGTH),
+      fromNodeId: this.state.nodeId,
+      fromName: this.state.name,
+      fromMachine: this.state.name,
+      from: this.state.name,
+      fromPort: this.port,
+      thread: task.thread || undefined,
+      noWake: true,
+      originSession: task.sessionId || undefined,
+    };
+    try {
+      const response = await fetch(`http://${host}:${target.port}${API_PREFIX}/task`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(8000),
+      });
+      const result = await response.json().catch(() => ({}));
+      task.replyStatus = response.ok && result.ok ? "delivered" : "rejected";
+    } catch (error) {
+      task.replyStatus = "failed";
+      task.replyError = error instanceof Error ? error.message.slice(0, 200) : "Unknown reply error.";
+    }
+  }
+
   startTaskDispatch(id) {
     const operation = this.dispatchIncomingTask(id);
     this.backgroundTasks.add(operation);
@@ -1074,6 +1127,7 @@ export class MeshRuntime {
         ? "Completed in an isolated task session with tools enabled."
         : "Completed in an isolated task session with tools disabled. Pair the peer to let it use tools.";
       if (route) route.lastUsedAt = this.now();
+      await this.deliverReply(task);
     } catch (error) {
       task.status = "failed";
       task.dispatchError = error instanceof Error ? error.message.slice(0, 512) : "Unknown task-session error.";
