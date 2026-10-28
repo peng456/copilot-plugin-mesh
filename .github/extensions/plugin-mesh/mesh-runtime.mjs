@@ -1170,10 +1170,12 @@ export class MeshRuntime {
       return;
     }
     const host = target.host.includes(":") ? `[${target.host}]` : target.host;
-    // noWake marks the answer as a notice so it cannot create a session on a
-    // peer that never asked for one. A peer that did ask matches it against its
-    // own outbound task and overrides noWake (see prepareIncomingTask); loops
-    // stay impossible because the isReply guard above refuses to answer twice.
+    // dsh-plugin-mesh only marks "pure receipts" noWake (lib/prompt.js: a receipt
+    // is relayed to the user and never re-dispatched). The answer to a task is
+    // the opposite: it has to wake the sender's agent, or the requester never
+    // sees the result. Sending it noWake made DSH file it as noted-only, so the
+    // answer arrived and was never read. Loops stay impossible without noWake
+    // because both sides refuse to answer a message they recognise as a reply.
     const body = {
       id: `${task.id}:reply`,
       task: task.result.slice(0, MAX_TASK_LENGTH),
@@ -1183,7 +1185,7 @@ export class MeshRuntime {
       from: this.state.name,
       fromPort: this.port,
       thread: task.thread || undefined,
-      noWake: true,
+      noWake: false,
       originSession: task.sessionId || undefined,
     };
     try {

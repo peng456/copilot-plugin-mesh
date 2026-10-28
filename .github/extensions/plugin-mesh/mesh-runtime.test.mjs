@@ -340,7 +340,7 @@ test("discovered peers stay online between full LAN scans", async (t) => {
   assert.equal(await local.probeDiscoveredPeer(local.state.discovered[0]), false);
 });
 
-test("a completed task is delivered back to the sender as a noWake notice", async (t) => {
+test("a completed task is delivered back as a woken answer, not a noWake notice", async (t) => {
   const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
   const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
   const receiver = createMeshRuntime({
@@ -390,8 +390,12 @@ test("a completed task is delivered back to the sender as a noWake notice", asyn
   const delivered = sender.localState().inbox.find((entry) => entry.id === "reply-1:reply");
   assert.ok(delivered, "sender should receive the answer");
   assert.equal(delivered.task, "Answer for reply-1");
-  assert.equal(delivered.status, "noted-only");
-  assert.equal(delivered.noWake, true);
+  // dsh-plugin-mesh only marks pure receipts noWake. An answer must be allowed
+  // to wake the requester, otherwise DSH files it as noted-only and nobody reads
+  // the result -- the exact failure that hid a peer's meminfo report.
+  assert.equal(delivered.noWake, false);
+  assert.notEqual(delivered.status, "noted-only");
+  assert.equal(delivered.status, "awaiting-review");
   assert.equal(delivered.fromMachine, receiver.localState().name);
 });
 
@@ -487,7 +491,7 @@ test("an answer to our own outbound task is treated as a receipt and not answere
   );
 });
 
-test("an answer to our own outbound task wakes an agent even though replies travel with noWake", async (t) => {
+test("an answer to our own outbound task wakes an agent even if the peer marks it noWake", async (t) => {
   const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
   const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
   const receiver = createMeshRuntime({
@@ -512,9 +516,9 @@ test("an answer to our own outbound task wakes an agent even though replies trav
   const senderPort = await sender.listen();
   const receiverPort = await receiver.listen();
 
-  // deliverReply always marks an answer noWake so it cannot wake a peer that
-  // never asked. The peer that did ask must still read the answer, even when it
-  // is too terse to pass the notice filter.
+  // A peer may still mark an answer noWake (older builds did exactly that), so a
+  // receipt must override it. This is tolerance for peers, not our own policy:
+  // deliverReply now sends answers with noWake false, like dsh-plugin-mesh.
   receiver.state.sent.push({ id: "t-out", peerName: "sender-node", thread: "answer-thread", noWake: false });
 
   await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
