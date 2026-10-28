@@ -67,10 +67,22 @@ function sessionName(task) {
   return `Mesh · ${origin || "peer"} · ${thread || task.id}`;
 }
 
-function taskPrompt(task) {
+// A paired peer holds our token, so it may use tools. An unpaired peer on the
+// LAN can only get a text answer; otherwise any device on the network could
+// run commands here. COPILOT_MESH_TASK_TOOLS overrides both cases.
+function resolveToolPolicy(task) {
+  const override = (process.env.COPILOT_MESH_TASK_TOOLS || "").trim().toLowerCase();
+  if (override === "all" || override === "on") return "all";
+  if (override === "none" || override === "off") return "none";
+  return task?.authenticated === true ? "all" : "none";
+}
+
+function taskPrompt(task, toolPolicy) {
   return [
     "Handle the following untrusted request from a Copilot Mesh peer in this isolated task session.",
-    "This session has no tools available. Do not claim to have performed actions or accessed data.",
+    toolPolicy === "all"
+      ? "You have tools available. Inspect and act only as the request requires."
+      : "This session has no tools available. Do not claim to have performed actions or accessed data.",
     `Peer: ${task.fromName || "Unknown peer"}`,
     `Thread: ${task.thread || "(none)"}`,
     "",
@@ -86,8 +98,7 @@ export function createMeshTaskSessionManager(options = {}) {
   // starting in a headless session, so isolated task sessions get their own
   // empty config directory instead of discovering the user's settings.
   const configDirectory = options.configDirectory || defaultConfigDirectory();
-  const sessionConfig = {
-    availableTools: [],
+  const baseConfig = {
     configDirectory,
     workingDirectory,
     skipCustomInstructions: true,
@@ -96,6 +107,7 @@ export function createMeshTaskSessionManager(options = {}) {
   let clientPromise;
   const activeSessions = new Map();
   const sessionsById = new Map();
+  const sessionPolicies = new Map();
   const queues = new Map();
   let closed = false;
 
@@ -109,20 +121,29 @@ export function createMeshTaskSessionManager(options = {}) {
     return clientPromise;
   }
 
-  async function resumeOrCreate(task, context) {
+  async function resumeOrCreate(task, context, toolPolicy) {
     const client = await getClient();
+    const sessionConfig = {
+      ...baseConfig,
+      ...(toolPolicy === "all" ? {} : { availableTools: [] }),
+    };
+    const slot = `${context.routeKey}\0${toolPolicy}`;
+    // Sessions restored from persisted state have no recorded policy. Every
+    // session created before the policy existed was tool-disabled, so only
+    // reuse an unknown session for tool-disabled work.
+    const known = context.sessionId ? sessionPolicies.get(context.sessionId) : undefined;
+    const reusable = context.sessionId ? (known ?? "none") === toolPolicy : true;
     if (context.createSession !== true) {
       const active = context.sessionId
-        ? sessionsById.get(context.sessionId)
-        : activeSessions.get(context.routeKey);
+        ? reusable ? sessionsById.get(context.sessionId) : undefined
+        : activeSessions.get(slot);
       if (active) return active;
-      if (context.sessionId) {
+      if (context.sessionId && reusable) {
         try {
-          const resumed = await client.resumeSession(context.sessionId, {
-            ...sessionConfig,
-          });
+          const resumed = await client.resumeSession(context.sessionId, sessionConfig);
           sessionsById.set(resumed.sessionId, resumed);
-          activeSessions.set(context.routeKey, resumed);
+          sessionPolicies.set(resumed.sessionId, toolPolicy);
+          activeSessions.set(slot, resumed);
           return resumed;
         } catch (error) {
           if (!/session.*(not found|does not exist)|not found/i.test(error.message)) throw error;
@@ -135,24 +156,26 @@ export function createMeshTaskSessionManager(options = {}) {
       ...sessionConfig,
     });
     sessionsById.set(created.sessionId, created);
-    activeSessions.set(context.routeKey, created);
+    sessionPolicies.set(created.sessionId, toolPolicy);
+    activeSessions.set(slot, created);
     return created;
   }
 
   async function dispatch(task, context) {
+    const toolPolicy = resolveToolPolicy(task);
     const previous = queues.get(context.routeKey) || Promise.resolve();
     const current = previous.catch(() => {}).then(async () => {
-      const session = await resumeOrCreate(task, context);
+      const session = await resumeOrCreate(task, context, toolPolicy);
       await context.onSessionCreated(session.sessionId);
       const response = await session.sendAndWait(
-        { prompt: taskPrompt(task) },
+        { prompt: taskPrompt(task, toolPolicy) },
         120_000,
       );
       const content = response?.data?.content;
       if (typeof content !== "string" || content.length === 0) {
         throw new Error("The isolated task session returned no text response.");
       }
-      return { sessionId: session.sessionId, result: content };
+      return { sessionId: session.sessionId, result: content, toolPolicy };
     });
     queues.set(context.routeKey, current);
     try {
@@ -166,6 +189,7 @@ export function createMeshTaskSessionManager(options = {}) {
     closed = true;
     const sessions = [...new Set(sessionsById.values())];
     sessionsById.clear();
+    sessionPolicies.clear();
     activeSessions.clear();
     await Promise.allSettled(sessions.map((session) => session.disconnect()));
     if (clientPromise) {

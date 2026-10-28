@@ -1026,7 +1026,9 @@ export class MeshRuntime {
     task.threadKey = threadKey;
     task.createSession = createSession;
     task.status = "dispatching";
-    task.routeDecision = "Queued in an isolated task session with tools disabled.";
+    task.routeDecision = task.authenticated
+      ? "Queued in an isolated task session with tools enabled."
+      : "Queued in an isolated task session with tools disabled.";
   }
 
   startTaskDispatch(id) {
@@ -1066,8 +1068,11 @@ export class MeshRuntime {
       }
       task.sessionId = result.sessionId;
       task.result = typeof result.result === "string" ? result.result.slice(0, 16_384) : "";
+      task.toolPolicy = result.toolPolicy === "all" ? "all" : "none";
       task.status = "completed";
-      task.routeDecision = "Completed in an isolated task session with tools disabled.";
+      task.routeDecision = task.toolPolicy === "all"
+        ? "Completed in an isolated task session with tools enabled."
+        : "Completed in an isolated task session with tools disabled. Pair the peer to let it use tools.";
       if (route) route.lastUsedAt = this.now();
     } catch (error) {
       task.status = "failed";

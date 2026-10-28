@@ -138,3 +138,45 @@ test("empty responses fail the dispatch and close stops the runtime", async () =
     /closed/,
   );
 });
+
+test("paired peers get tools while unpaired peers stay tool-free", async (t) => {
+  const client = fakeClient({ reply: "ok" });
+  const manager = createMeshTaskSessionManager(managerOptions(client));
+  t.after(() => manager.close());
+
+  const paired = await manager.dispatch(
+    { id: "task-1", thread: "thread-p", task: "check load", authenticated: true },
+    { routeKey: "route-paired", createSession: true, onSessionCreated: () => {} },
+  );
+  assert.equal(paired.toolPolicy, "all");
+  assert.equal(client.created[0].config.availableTools, undefined);
+  assert.match(client.created[0].sent[0].prompt, /You have tools available/);
+
+  const unpaired = await manager.dispatch(
+    { id: "task-2", thread: "thread-u", task: "check load", authenticated: false },
+    { routeKey: "route-unpaired", createSession: true, onSessionCreated: () => {} },
+  );
+  assert.equal(unpaired.toolPolicy, "none");
+  assert.deepEqual(client.created[1].config.availableTools, []);
+  assert.match(client.created[1].sent[0].prompt, /no tools available/);
+});
+
+test("a route that changes tool policy starts a fresh session", async (t) => {
+  const client = fakeClient({ reply: "ok" });
+  const manager = createMeshTaskSessionManager(managerOptions(client));
+  t.after(() => manager.close());
+
+  const first = await manager.dispatch(
+    { id: "task-1", thread: "thread-x", task: "hello", authenticated: false },
+    { routeKey: "route-x", createSession: true, onSessionCreated: () => {} },
+  );
+  const second = await manager.dispatch(
+    { id: "task-2", thread: "thread-x", task: "hello again", authenticated: true },
+    { routeKey: "route-x", sessionId: first.sessionId, createSession: false, onSessionCreated: () => {} },
+  );
+
+  assert.notEqual(second.sessionId, first.sessionId);
+  assert.equal(client.created.length, 2);
+  assert.deepEqual(client.created[0].config.availableTools, []);
+  assert.equal(client.created[1].config.availableTools, undefined);
+});

@@ -956,7 +956,7 @@ extensionSession = await joinSession({
   canvases: [pluginMeshCanvas],
   hooks: {
     onSessionStart: async () => ({
-      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically, but control and outbound task dispatch require manual pairing. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. The isolated session has all tools disabled, so it can produce a response but cannot perform file, shell, or network actions. noWake, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
+      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically, but control and outbound task dispatch require manual pairing. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions from paired peers have tools enabled; tasks from unpaired LAN peers run with all tools disabled and can only return text. noWake, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
     }),
     onSessionEnd: async () => {
       try {
