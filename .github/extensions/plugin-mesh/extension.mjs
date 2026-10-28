@@ -168,16 +168,6 @@ function renderHtml() {
         .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 26px 0 12px; }
         h2 { margin: 0; font-size: 14px; font-weight: 700; }
         .count { color: var(--mesh-muted); font-size: 12px; }
-        .plugin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
-        .plugin {
-          min-width: 0; padding: 14px; border: 1px solid var(--mesh-border); border-radius: 12px;
-          background: var(--mesh-surface); transition: border-color .15s, transform .15s;
-        }
-        .plugin:hover { border-color: color-mix(in srgb, var(--mesh-accent) 55%, var(--mesh-border)); transform: translateY(-1px); }
-        .plugin-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-        .plugin-name { font-family: var(--font-mono, monospace); font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
-        .badge { padding: 2px 8px; border-radius: 999px; background: var(--mesh-subtle); color: var(--mesh-muted); font-size: 10px; }
-        .plugin p { margin: 8px 0 0; color: var(--mesh-muted); font-size: 12px; }
         .panel {
           margin-top: 24px; border: 1px solid var(--mesh-border); border-radius: 14px;
           background: var(--mesh-surface); overflow: hidden;
@@ -312,13 +302,6 @@ function renderHtml() {
             <div class="task-list" id="sent-list"></div>
           </div>
         </section>
-        <section aria-labelledby="plugins-heading">
-          <div class="section-heading">
-            <h2 id="plugins-heading">已注册插件</h2>
-            <span class="count" id="plugin-count">加载中…</span>
-          </div>
-          <div class="plugin-grid" id="plugin-list" aria-live="polite"></div>
-        </section>
         <section class="panel" aria-labelledby="run-heading">
           <div class="panel-heading">
             <h2 id="run-heading">运行插件链</h2>
@@ -346,41 +329,6 @@ function renderHtml() {
       </main>
 
       <script>
-        async function loadPlugins() {
-          const list = document.getElementById("plugin-list");
-          const count = document.getElementById("plugin-count");
-          try {
-            const response = await fetch("/api/plugins");
-            if (!response.ok) throw new Error("无法读取插件列表");
-            const data = await response.json();
-            count.textContent = data.plugins.length + " 个插件";
-            if (data.plugins.length === 0) {
-              list.textContent = "暂无已注册插件";
-              return;
-            }
-            for (const plugin of data.plugins) {
-              const card = document.createElement("article");
-              card.className = "plugin";
-              const head = document.createElement("div");
-              head.className = "plugin-head";
-              const name = document.createElement("span");
-              name.className = "plugin-name";
-              name.textContent = plugin.name;
-              const badge = document.createElement("span");
-              badge.className = "badge";
-              badge.textContent = plugin.kind === "builtin" ? "内置" : "自定义";
-              const description = document.createElement("p");
-              description.textContent = plugin.description;
-              head.append(name, badge);
-              card.append(head, description);
-              list.append(card);
-            }
-          } catch (error) {
-            count.textContent = "加载失败";
-            list.textContent = error.message;
-          }
-        }
-
         let meshToken = "";
         let tokenVisible = false;
 
@@ -800,7 +748,6 @@ function renderHtml() {
         }
 
         document.getElementById("run-form").addEventListener("submit", runChain);
-        loadPlugins();
         loadMesh();
         window.setInterval(loadMesh, 3000);
       </script>
@@ -841,12 +788,6 @@ function startLoopbackServer(instanceId) {
           res.end(JSON.stringify({ error: error.message }));
         }
       });
-      return;
-    }
-
-    if (req.method === 'GET' && req.url === '/api/plugins') {
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ plugins: listCurrentPlugins() }));
       return;
     }
 
