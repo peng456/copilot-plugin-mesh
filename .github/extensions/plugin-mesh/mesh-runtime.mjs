@@ -989,10 +989,11 @@ export class MeshRuntime {
   prepareIncomingTask(task, requestAddress) {
     const text = task.task.trim();
     // A matched reply is the answer to a task we sent, so it has to reach an
-    // agent. Replies always travel with noWake (see deliverReply) and are often
-    // terse, so without this override every answer would be filed as a notice
-    // and silently never read. Loops stay impossible because deliverReply
-    // refuses to answer anything already marked as a reply.
+    // agent. Our own answers travel without noWake (see deliverReply), but a
+    // peer may still mark its answer noWake, and answers are often terse, so
+    // without this override such a reply would be filed as a notice and never
+    // read. Loops stay impossible because deliverReply refuses to answer
+    // anything already marked as a reply.
     const isReply = task.isReply === true;
     const noticeLike = [...text].length < MIN_TASK_CHARS || NOTICE_ONLY_PATTERN.test(text);
     if (isReply) {
