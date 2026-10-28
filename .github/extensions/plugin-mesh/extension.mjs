@@ -198,12 +198,6 @@ function renderHtml() {
         button:active { transform: translateY(1px); }
         button:disabled { opacity: .65; cursor: wait; }
         .hint { color: var(--mesh-muted); font-size: 11px; }
-        .result-wrap { display: none; padding: 0 18px 18px; }
-        .result-wrap.visible { display: block; }
-        .result-title { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 12px; font-weight: 650; }
-        .result { margin: 0; border: 1px solid var(--mesh-border); border-radius: 9px; padding: 13px;
-          background: var(--mesh-subtle); color: var(--mesh-text); font: 12px/1.55 var(--font-mono, monospace);
-          white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; }
         .error { color: var(--color-danger-fg, #cf222e); }
         .mesh-banner {
           margin: 14px 0 18px; padding: 12px 14px; border: 1px solid color-mix(in srgb, #bf8700 35%, var(--mesh-border));
@@ -250,7 +244,7 @@ function renderHtml() {
         </header>
         <section class="intro">
           <h1>插件工作台</h1>
-          <p>管理可信 Copilot 节点、收发任务请求，也可以串联本地插件。跨设备任务始终需要接收方人工审核。</p>
+          <p>管理可信 Copilot 节点、收发任务请求。跨设备任务始终需要接收方人工审核。</p>
         </section>
         <section class="panel" aria-labelledby="mesh-heading">
           <div class="panel-heading">
@@ -300,30 +294,6 @@ function renderHtml() {
             <div class="task-list" id="inbox-list"></div>
             <div class="section-heading subheading"><h2>发送记录</h2></div>
             <div class="task-list" id="sent-list"></div>
-          </div>
-        </section>
-        <section class="panel" aria-labelledby="run-heading">
-          <div class="panel-heading">
-            <h2 id="run-heading">运行插件链</h2>
-            <p>按顺序输入插件名称，用逗号分隔。</p>
-          </div>
-          <form class="form" id="run-form">
-            <div class="field">
-              <label for="plugin-input">执行顺序</label>
-              <input id="plugin-input" value="echo, ping" autocomplete="off" spellcheck="false" />
-            </div>
-            <div class="field">
-              <label for="payload-input">初始输入</label>
-              <textarea id="payload-input" spellcheck="false">{"message":"hello"}</textarea>
-            </div>
-            <div class="actions">
-              <button id="run-button" type="submit"><span aria-hidden="true">▶</span> 执行插件链</button>
-              <span class="hint">JSON 或普通文本均可</span>
-            </div>
-          </form>
-          <div class="result-wrap" id="result-wrap">
-            <div class="result-title"><span>执行结果</span><span id="result-status"></span></div>
-            <pre class="result" id="result-output"></pre>
           </div>
         </section>
       </main>
@@ -707,47 +677,6 @@ function renderHtml() {
           }
         });
 
-        async function runChain(event) {
-          event.preventDefault();
-          const button = document.getElementById("run-button");
-          const resultWrap = document.getElementById("result-wrap");
-          const output = document.getElementById("result-output");
-          const status = document.getElementById("result-status");
-          const names = document.getElementById("plugin-input").value.split(",").map((item) => item.trim()).filter(Boolean);
-          const payload = (() => {
-            try {
-              return JSON.parse(document.getElementById("payload-input").value);
-            } catch {
-              return document.getElementById("payload-input").value;
-            }
-          })();
-
-          resultWrap.classList.add("visible");
-          output.classList.remove("error");
-          status.textContent = "";
-          button.disabled = true;
-          button.textContent = "执行中…";
-          try {
-            const response = await fetch("/api/invoke", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ names, input: payload })
-            });
-            const result = await response.json();
-            if (!response.ok) throw new Error(result.error || "插件执行失败");
-            output.textContent = JSON.stringify(result, null, 2);
-            status.textContent = "成功 · " + result.pluginCount + " 步";
-          } catch (error) {
-            output.textContent = error.message;
-            output.classList.add("error");
-            status.textContent = "执行失败";
-          } finally {
-            button.disabled = false;
-            button.textContent = "▶ 执行插件链";
-          }
-        }
-
-        document.getElementById("run-form").addEventListener("submit", runChain);
         loadMesh();
         window.setInterval(loadMesh, 3000);
       </script>
@@ -791,26 +720,6 @@ function startLoopbackServer(instanceId) {
       return;
     }
 
-    if (req.method === 'POST' && req.url === '/api/invoke') {
-      let body = '';
-      req.on('data', (chunk) => {
-        body += chunk.toString();
-      });
-      req.on('end', async () => {
-        try {
-          const payload = JSON.parse(body || '{}');
-          const result = await invokePluginChain(payload.names || payload.chain, payload.input);
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify(result));
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'unknown error';
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ error: message }));
-        }
-      });
-      return;
-    }
-
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderHtml());
   });
@@ -829,7 +738,7 @@ function startLoopbackServer(instanceId) {
 const pluginMeshCanvas = createCanvas({
   id: "plugin-mesh",
   displayName: "Copilot Mesh",
-  description: "Pair Copilot nodes, review incoming task requests, and run local plugin chains.",
+  description: "Pair Copilot nodes and review incoming task requests.",
   actions: [
     {
       name: "mesh_status",
