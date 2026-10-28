@@ -292,6 +292,7 @@ export class MeshRuntime {
 
   async listen() {
     if (!this.state) throw new Error("Initialize the mesh runtime before listening.");
+    if (this.listening) return this.port;
     this.server = createServer((request, response) => {
       this.handleRequest(request, response).catch((error) => {
         if (!response.headersSent) this.sendJson(response, 500, { ok: false, error: "Internal mesh error." });
@@ -318,6 +319,10 @@ export class MeshRuntime {
       if (task.status === "dispatching") this.startTaskDispatch(task.id);
     }
     return this.port;
+  }
+
+  get listening() {
+    return Boolean(this.server?.listening && this.port);
   }
 
   async close() {

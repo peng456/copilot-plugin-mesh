@@ -590,3 +590,30 @@ test("a reply is never routed to a mesh node that is not the sender", async (t) 
     "an unrelated node must not receive the answer",
   );
 });
+
+test("a mesh runtime can take over its port after the previous owner exits", async (t) => {
+  const blocker = createServer();
+  await new Promise((resolveListen) => blocker.listen(0, "0.0.0.0", resolveListen));
+  const port = blocker.address().port;
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const runtime = createMeshRuntime({ copilotHome: home, port, host: "0.0.0.0", discovery: false });
+  t.after(async () => {
+    await runtime.close();
+    await new Promise((resolveClose) => blocker.close(resolveClose));
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await runtime.initialize();
+  assert.equal(runtime.listening, false);
+  await assert.rejects(runtime.listen(), { code: "EADDRINUSE" });
+  assert.equal(runtime.listening, false);
+  assert.equal(runtime.port, null);
+
+  // The leftover process exits, and the same runtime claims the port on retry.
+  await new Promise((resolveClose) => blocker.close(resolveClose));
+  assert.equal(await runtime.listen(), port);
+  assert.equal(runtime.listening, true);
+  const health = await fetch(`http://127.0.0.1:${port}/mesh/v1/health`);
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).nodeId, runtime.state.nodeId);
+});

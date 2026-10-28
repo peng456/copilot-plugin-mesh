@@ -618,8 +618,8 @@ function renderHtml() {
             document.getElementById("mesh-meta").replaceChildren(
               metaItem("节点名称", state.name),
               metaItem("节点 ID", state.nodeId),
-              metaItem("监听地址", state.addresses.length ? state.addresses.map((ip) => "http://" + ip + ":" + state.port).join("\\n") : "未发现私有网卡地址"),
-              metaItem("端口", String(state.port))
+              metaItem("监听地址", state.port ? (state.addresses.length ? state.addresses.map((ip) => "http://" + ip + ":" + state.port).join("\\n") : "未发现私有网卡地址") : "未监听（离线）"),
+              metaItem("端口", state.port ? String(state.port) : (state.listenError || "未监听")),
             );
             if (document.activeElement !== document.getElementById("machine-name")) {
               document.getElementById("machine-name").value = state.name;
@@ -763,7 +763,7 @@ function startLoopbackServer(instanceId) {
   const server = createServer((req, res) => {
     if (req.method === "GET" && req.url === "/api/mesh/state") {
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-      res.end(JSON.stringify(mesh.localState({ includeToken: true })));
+      res.end(JSON.stringify({ ...mesh.localState({ includeToken: true }), listenError: meshListenError }));
       return;
     }
 
@@ -955,12 +955,34 @@ await mesh.initialize();
 // A second install or a leftover process can already own the mesh port. That
 // must not take the canvas down with it: report the reason and stay usable.
 let meshListenError = null;
-try {
-  await mesh.listen();
-} catch (error) {
-  meshListenError = error.code === "EADDRINUSE"
-    ? `Port ${mesh.requestedPort} is already in use by another Copilot Mesh process.`
-    : error.message;
+let meshListenRetryTimer = null;
+
+async function tryListen() {
+  try {
+    await mesh.listen();
+    meshListenError = null;
+    return true;
+  } catch (error) {
+    meshListenError = error.code === "EADDRINUSE"
+      ? `Port ${mesh.requestedPort} is already in use by another Copilot Mesh process.`
+      : error.message;
+    return false;
+  }
+}
+
+await tryListen();
+// The process from the previous launch can hold the port for a few seconds
+// after a restart. Keep retrying so this node rejoins the mesh by itself
+// instead of staying invisible until the next manual restart.
+if (meshListenError) {
+  const retry = setInterval(() => {
+    if (mesh.listening) return;
+    tryListen().then((listening) => {
+      if (listening) clearInterval(retry);
+    });
+  }, 5_000);
+  retry.unref?.();
+  meshListenRetryTimer = retry;
 }
 
 extensionSession = await joinSession({
@@ -970,6 +992,8 @@ extensionSession = await joinSession({
       additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically, but control and outbound task dispatch require manual pairing. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions keep tools available by default, matching DSH's workspace-write permission preset; set COPILOT_MESH_TASK_TOOLS=none to run them without tools. A completed task is returned to the sender once as a noWake notice, and a receipt is never answered again. noWake, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
     }),
     onSessionEnd: async () => {
+      if (meshListenRetryTimer) clearInterval(meshListenRetryTimer);
+      meshListenRetryTimer = null;
       try {
         await taskSessions.close();
       } finally {
