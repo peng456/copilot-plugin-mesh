@@ -539,7 +539,7 @@ test("an answer to our own outbound task wakes an agent even though replies trav
   assert.equal(task.isReply, true);
   assert.equal(task.replyToTaskId, "t-out");
   assert.equal(task.status, "completed");
-  assert.equal(task.wakeOverride, "noWake");
+  assert.equal(task.wakeOverride, "noWake+notice-filter");
   assert.equal(task.replyStatus, "skipped-reply");
   assert.equal(receiver.state.sent.find((entry) => entry.id === "t-out").repliedAt !== undefined, true);
   assert.equal(

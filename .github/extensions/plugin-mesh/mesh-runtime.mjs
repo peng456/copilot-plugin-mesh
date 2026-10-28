@@ -994,13 +994,19 @@ export class MeshRuntime {
     // and silently never read. Loops stay impossible because deliverReply
     // refuses to answer anything already marked as a reply.
     const isReply = task.isReply === true;
-    if (isReply && task.noWake) task.wakeOverride = "noWake";
+    const noticeLike = [...text].length < MIN_TASK_CHARS || NOTICE_ONLY_PATTERN.test(text);
+    if (isReply) {
+      const overrides = [];
+      if (task.noWake) overrides.push("noWake");
+      if (noticeLike) overrides.push("notice-filter");
+      if (overrides.length > 0) task.wakeOverride = overrides.join("+");
+    }
     if (task.noWake && !isReply) {
       task.status = "noted-only";
       task.routeDecision = "The sender requested noWake; the task is stored without creating a session.";
       return;
     }
-    if (!isReply && ([...text].length < MIN_TASK_CHARS || NOTICE_ONLY_PATTERN.test(text))) {
+    if (!isReply && noticeLike) {
       task.status = "noted-only";
       task.routeDecision = "Short or notice-only message; no session was created.";
       return;
