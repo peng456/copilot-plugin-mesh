@@ -41,6 +41,7 @@ const taskSessions = createMeshTaskSessionManager();
 let extensionSession;
 const mesh = createMeshRuntime({
   taskDispatcher: taskSessions.dispatch,
+  conversationOpener: taskSessions.openConversation,
   onError: (error) => extensionSession?.log(`Mesh task dispatch failed: ${error.message}`, { level: "error" }),
 });
 
@@ -168,16 +169,6 @@ function renderHtml() {
         .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 26px 0 12px; }
         h2 { margin: 0; font-size: 14px; font-weight: 700; }
         .count { color: var(--mesh-muted); font-size: 12px; }
-        .plugin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
-        .plugin {
-          min-width: 0; padding: 14px; border: 1px solid var(--mesh-border); border-radius: 12px;
-          background: var(--mesh-surface); transition: border-color .15s, transform .15s;
-        }
-        .plugin:hover { border-color: color-mix(in srgb, var(--mesh-accent) 55%, var(--mesh-border)); transform: translateY(-1px); }
-        .plugin-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-        .plugin-name { font-family: var(--font-mono, monospace); font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
-        .badge { padding: 2px 8px; border-radius: 999px; background: var(--mesh-subtle); color: var(--mesh-muted); font-size: 10px; }
-        .plugin p { margin: 8px 0 0; color: var(--mesh-muted); font-size: 12px; }
         .panel {
           margin-top: 24px; border: 1px solid var(--mesh-border); border-radius: 14px;
           background: var(--mesh-surface); overflow: hidden;
@@ -208,12 +199,6 @@ function renderHtml() {
         button:active { transform: translateY(1px); }
         button:disabled { opacity: .65; cursor: wait; }
         .hint { color: var(--mesh-muted); font-size: 11px; }
-        .result-wrap { display: none; padding: 0 18px 18px; }
-        .result-wrap.visible { display: block; }
-        .result-title { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 12px; font-weight: 650; }
-        .result { margin: 0; border: 1px solid var(--mesh-border); border-radius: 9px; padding: 13px;
-          background: var(--mesh-subtle); color: var(--mesh-text); font: 12px/1.55 var(--font-mono, monospace);
-          white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; }
         .error { color: var(--color-danger-fg, #cf222e); }
         .mesh-banner {
           margin: 14px 0 18px; padding: 12px 14px; border: 1px solid color-mix(in srgb, #bf8700 35%, var(--mesh-border));
@@ -260,12 +245,12 @@ function renderHtml() {
         </header>
         <section class="intro">
           <h1>插件工作台</h1>
-          <p>管理可信 Copilot 节点、收发任务请求，也可以串联本地插件。跨设备任务始终需要接收方人工审核。</p>
+          <p>管理可信 Copilot 节点、收发任务请求。跨设备任务始终需要接收方人工审核。</p>
         </section>
         <section class="panel" aria-labelledby="mesh-heading">
           <div class="panel-heading">
             <h2 id="mesh-heading">Copilot Mesh 节点</h2>
-            <p>自动发现同网段节点，也可手动扫描；发现不代表信任，配对仍需你提供对端令牌。</p>
+            <p>自动发现同网段节点，也可手动扫描；发现即可派发任务，配对码开关决定是否强制校验令牌。</p>
           </div>
           <div class="form">
             <div class="mesh-meta" id="mesh-meta"><div class="empty">正在读取节点状态…</div></div>
@@ -274,7 +259,9 @@ function renderHtml() {
               <code id="local-token">配对令牌已隐藏</code>
               <button class="secondary-button small-button" id="toggle-token" type="button">显示令牌</button>
             </div>
-            <div class="mesh-banner">配对令牌通过 HTTP 明文传输，仅在可信私有网络使用。收到的任务只进入待审核收件箱，不会自动发送给 Copilot 或执行。</div>
+            <label class="checkbox-field" for="require-pairing"><input id="require-pairing" type="checkbox" /><span>要求配对码（开启后未持有令牌的对端无法派发任务）</span></label>
+            <p class="capability-note" id="pairing-summary"></p>
+            <div class="mesh-banner">配对令牌通过 HTTP 明文传输，仅在可信私有网络使用。关闭配对码时，同一局域网的已发现节点可直接派发任务；收到的任务会交给独立的隔离任务会话处理，不会注入当前对话。</div>
 
             <form id="name-form" class="name-row">
               <div class="field"><label for="machine-name">本机名称</label><input id="machine-name" required maxlength="32" /></div>
@@ -296,8 +283,8 @@ function renderHtml() {
             <div class="section-heading subheading"><h2>派发任务</h2><span class="count">按对端策略处理</span></div>
             <form id="task-form">
               <div class="field"><label for="task-peer">目标节点</label><select id="task-peer" required></select></div>
-              <div class="field"><label for="task-thread">线程标签（可选）</label><input id="task-thread" maxlength="128" placeholder="用于关联同一件事的后续请求" /></div>
-              <div class="field"><label for="task-text">任务请求</label><textarea id="task-text" maxlength="262144" required placeholder="写下你希望对端隔离任务会话处理的请求…"></textarea></div>
+              <div class="field"><label for="task-thread">线程标签（可选）</label><input id="task-thread" maxlength="128" placeholder="留空则自动生成，用于关联同一件事的后续请求" /></div>
+              <div class="field"><label for="task-text">任务请求</label><textarea id="task-text" maxlength="262144" required placeholder="写下你希望对端隔离任务会话处理的请求…"></textarea><p class="capability-note" id="task-wake-hint"></p></div>
               <label class="checkbox-field" for="task-no-wake"><input id="task-no-wake" type="checkbox" /><span>仅记录在对端收件箱，不唤醒 agent（noWake）</span></label>
               <div class="mesh-banner">默认按 DSH Mesh 协议发送普通任务；对端策略可能会唤醒 agent 或创建会话。只向你信任的节点派发。勾选 noWake 可要求对端仅记录。</div>
               <div class="actions"><button type="submit">发送任务</button><span class="hint">送达不代表任务已完成。</span></div>
@@ -310,75 +297,9 @@ function renderHtml() {
             <div class="task-list" id="sent-list"></div>
           </div>
         </section>
-        <section aria-labelledby="plugins-heading">
-          <div class="section-heading">
-            <h2 id="plugins-heading">已注册插件</h2>
-            <span class="count" id="plugin-count">加载中…</span>
-          </div>
-          <div class="plugin-grid" id="plugin-list" aria-live="polite"></div>
-        </section>
-        <section class="panel" aria-labelledby="run-heading">
-          <div class="panel-heading">
-            <h2 id="run-heading">运行插件链</h2>
-            <p>按顺序输入插件名称，用逗号分隔。</p>
-          </div>
-          <form class="form" id="run-form">
-            <div class="field">
-              <label for="plugin-input">执行顺序</label>
-              <input id="plugin-input" value="echo, ping" autocomplete="off" spellcheck="false" />
-            </div>
-            <div class="field">
-              <label for="payload-input">初始输入</label>
-              <textarea id="payload-input" spellcheck="false">{"message":"hello"}</textarea>
-            </div>
-            <div class="actions">
-              <button id="run-button" type="submit"><span aria-hidden="true">▶</span> 执行插件链</button>
-              <span class="hint">JSON 或普通文本均可</span>
-            </div>
-          </form>
-          <div class="result-wrap" id="result-wrap">
-            <div class="result-title"><span>执行结果</span><span id="result-status"></span></div>
-            <pre class="result" id="result-output"></pre>
-          </div>
-        </section>
       </main>
 
       <script>
-        async function loadPlugins() {
-          const list = document.getElementById("plugin-list");
-          const count = document.getElementById("plugin-count");
-          try {
-            const response = await fetch("/api/plugins");
-            if (!response.ok) throw new Error("无法读取插件列表");
-            const data = await response.json();
-            count.textContent = data.plugins.length + " 个插件";
-            if (data.plugins.length === 0) {
-              list.textContent = "暂无已注册插件";
-              return;
-            }
-            for (const plugin of data.plugins) {
-              const card = document.createElement("article");
-              card.className = "plugin";
-              const head = document.createElement("div");
-              head.className = "plugin-head";
-              const name = document.createElement("span");
-              name.className = "plugin-name";
-              name.textContent = plugin.name;
-              const badge = document.createElement("span");
-              badge.className = "badge";
-              badge.textContent = plugin.kind === "builtin" ? "内置" : "自定义";
-              const description = document.createElement("p");
-              description.textContent = plugin.description;
-              head.append(name, badge);
-              card.append(head, description);
-              list.append(card);
-            }
-          } catch (error) {
-            count.textContent = "加载失败";
-            list.textContent = error.message;
-          }
-        }
-
         let meshToken = "";
         let tokenVisible = false;
 
@@ -401,22 +322,35 @@ function renderHtml() {
           return item;
         }
 
-        function renderPeers(peers) {
+        function renderPeers(peers, discovered = []) {
           const list = document.getElementById("peer-list");
           const select = document.getElementById("task-peer");
           const selectedPeer = select.value;
           list.replaceChildren();
           select.replaceChildren();
+          // dsh-plugin-mesh dispatches to discovered nodes too, so the target
+          // list mirrors the discovery table instead of only paired peers.
+          const dispatchable = discovered.filter((peer) =>
+            peer.status === "online" && !peers.some((item) => item.nodeId === peer.nodeId));
           const prompt = document.createElement("option");
           prompt.value = "";
-          prompt.textContent = peers.length ? "选择一个已配对节点" : "先添加并配对节点";
+          prompt.textContent = peers.length || dispatchable.length
+            ? "选择一个节点"
+            : "先发现或配对节点";
           select.append(prompt);
           for (const peer of peers) {
             const option = document.createElement("option");
             option.value = peer.id;
-            option.textContent = peer.name + " · " + peer.status;
+            option.textContent = peer.name + " · 已配对 · " + peer.status;
             select.append(option);
-
+          }
+          for (const peer of dispatchable) {
+            const option = document.createElement("option");
+            option.value = peer.nodeId;
+            option.textContent = peer.name + " · 未配对 · " + peer.status;
+            select.append(option);
+          }
+          for (const peer of peers) {
             const card = document.createElement("article");
             card.className = "peer-item";
             const head = document.createElement("div");
@@ -472,11 +406,11 @@ function renderHtml() {
             }
             list.append(card);
           }
-          if (peers.some((peer) => peer.id === selectedPeer)) select.value = selectedPeer;
+          if ([...select.options].some((option) => option.value === selectedPeer)) select.value = selectedPeer;
           if (!peers.length) {
             const empty = document.createElement("div");
             empty.className = "empty";
-            empty.textContent = "尚未配对节点。请在另一台 Copilot 上安装此扩展，并将它的私有 IP、端口和配对令牌添加到这里。";
+            empty.textContent = "尚未配对节点。可以直接向已发现的节点派发任务，或粘贴对端令牌建立配对。";
             list.append(empty);
           }
         }
@@ -505,7 +439,19 @@ function renderHtml() {
               document.getElementById("peer-url").value = "http://" + peer.host + ":" + peer.port;
               document.getElementById("peer-token").focus();
             });
-            head.append(info, pair);
+            const dispatch = document.createElement("button");
+            dispatch.className = "secondary-button small-button";
+            dispatch.type = "button";
+            dispatch.textContent = "派发任务";
+            dispatch.addEventListener("click", () => {
+              document.getElementById("task-peer").value = peer.nodeId;
+              document.getElementById("task-text").focus();
+              setMeshFeedback("已选择未配对节点 " + peer.name + "，填写任务后发送即可。");
+            });
+            const discoveredActions = document.createElement("div");
+            discoveredActions.className = "actions";
+            discoveredActions.append(dispatch, pair);
+            head.append(info, discoveredActions);
             card.append(head);
             if (peer.capabilities || peer.capabilitiesStale === null) {
               const details = document.createElement("div");
@@ -555,10 +501,20 @@ function renderHtml() {
               decision.textContent = task.dispatchError || task.routeDecision;
               card.append(decision);
             }
+            if (!inbox) {
+              const conversation = task.conversationSessionId
+                ? "本地对话 " + task.conversationSessionId + "（对端回复会追加到同一对话）"
+                : task.conversationSkipped || (task.conversationError ? "本地对话创建失败：" + task.conversationError : "");
+              if (conversation) {
+                const note = document.createElement("small");
+                note.textContent = conversation;
+                card.append(note);
+              }
+            }
             if (inbox && task.result) {
               const result = document.createElement("pre");
               result.className = "task-text";
-              result.textContent = "隔离会话回复：\n" + task.result;
+              result.textContent = "隔离会话回复：\\n" + task.result;
               card.append(result);
             }
             if (inbox && ["awaiting-review", "failed", "rate-limited"].includes(task.status)) {
@@ -631,7 +587,13 @@ function renderHtml() {
               ? "本机能力：" + capabilities.os + " · " + capabilities.cpuCount + " CPU · " + Math.round(capabilities.memoryBytes / 1024 ** 3) + " GB RAM · " + Object.entries(capabilities.runtimes).map(([key, value]) => key + " " + value).join(" · ")
               : "本机能力暂不可用。";
             document.getElementById("local-token").textContent = tokenVisible ? meshToken : "配对令牌已隐藏";
-            renderPeers(state.peers);
+            const requirePairing = state.requirePairing === true;
+            const pairingToggle = document.getElementById("require-pairing");
+            if (document.activeElement !== pairingToggle) pairingToggle.checked = requirePairing;
+            document.getElementById("pairing-summary").textContent = requirePairing
+              ? "配对码：开 · 两端需使用同一个配对码，未配对的对端会被拒绝。"
+              : "配对码：关 · 同一局域网发现即可派发任务。";
+            renderPeers(state.peers, state.discovered);
             renderDiscovered(state.discovered);
             renderTasks("inbox-list", state.inbox, true);
             renderTasks("sent-list", state.sent);
@@ -680,6 +642,20 @@ function renderHtml() {
             setMeshFeedback(error.message, true);
           }
         });
+        document.getElementById("require-pairing").addEventListener("change", async (event) => {
+          const checkbox = event.currentTarget;
+          checkbox.disabled = true;
+          try {
+            await meshRequest("/api/mesh/pairing", { requirePairing: checkbox.checked });
+            await loadMesh();
+            setMeshFeedback(checkbox.checked ? "已开启配对码校验。" : "已关闭配对码校验，同网段发现即可派发。");
+          } catch (error) {
+            setMeshFeedback(error.message, true);
+            await loadMesh();
+          } finally {
+            checkbox.disabled = false;
+          }
+        });
         document.getElementById("peer-form").addEventListener("submit", async (event) => {
           event.preventDefault();
           try {
@@ -695,6 +671,18 @@ function renderHtml() {
             setMeshFeedback(error.message, true);
           }
         });
+        // dsh-plugin-mesh files anything shorter than minTaskChars (default 8) as
+        // a notice and never wakes an agent, so say so before the user sends.
+        function updateWakeHint() {
+          const text = document.getElementById("task-text").value.trim();
+          const hint = document.getElementById("task-wake-hint");
+          const tooShort = text.length > 0 && text.length < 8;
+          hint.textContent = tooShort
+            ? "正文仅 " + text.length + " 字符：对端默认把少于 8 字符的内容当作通知，只存收件箱、不唤醒 agent。"
+            : "";
+        }
+
+        document.getElementById("task-text").addEventListener("input", updateWakeHint);
         document.getElementById("task-form").addEventListener("submit", async (event) => {
           event.preventDefault();
           try {
@@ -705,6 +693,7 @@ function renderHtml() {
               noWake: document.getElementById("task-no-wake").checked
             });
             document.getElementById("task-text").value = "";
+            updateWakeHint();
             await loadMesh();
             setMeshFeedback(result.message);
           } catch (error) {
@@ -712,48 +701,6 @@ function renderHtml() {
           }
         });
 
-        async function runChain(event) {
-          event.preventDefault();
-          const button = document.getElementById("run-button");
-          const resultWrap = document.getElementById("result-wrap");
-          const output = document.getElementById("result-output");
-          const status = document.getElementById("result-status");
-          const names = document.getElementById("plugin-input").value.split(",").map((item) => item.trim()).filter(Boolean);
-          const payload = (() => {
-            try {
-              return JSON.parse(document.getElementById("payload-input").value);
-            } catch {
-              return document.getElementById("payload-input").value;
-            }
-          })();
-
-          resultWrap.classList.add("visible");
-          output.classList.remove("error");
-          status.textContent = "";
-          button.disabled = true;
-          button.textContent = "执行中…";
-          try {
-            const response = await fetch("/api/invoke", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ names, input: payload })
-            });
-            const result = await response.json();
-            if (!response.ok) throw new Error(result.error || "插件执行失败");
-            output.textContent = JSON.stringify(result, null, 2);
-            status.textContent = "成功 · " + result.pluginCount + " 步";
-          } catch (error) {
-            output.textContent = error.message;
-            output.classList.add("error");
-            status.textContent = "执行失败";
-          } finally {
-            button.disabled = false;
-            button.textContent = "▶ 执行插件链";
-          }
-        }
-
-        document.getElementById("run-form").addEventListener("submit", runChain);
-        loadPlugins();
         loadMesh();
         window.setInterval(loadMesh, 3000);
       </script>
@@ -771,6 +718,7 @@ function startLoopbackServer(instanceId) {
 
     const meshActions = {
       "/api/mesh/name": (body) => mesh.setName(body.name),
+      "/api/mesh/pairing": (body) => mesh.setRequirePairing(body.requirePairing),
       "/api/mesh/scan": () => mesh.scan(),
       "/api/mesh/peer": (body) => mesh.addPeer(body),
       "/api/mesh/peer/remove": (body) => mesh.removePeer(body.id),
@@ -796,32 +744,6 @@ function startLoopbackServer(instanceId) {
       return;
     }
 
-    if (req.method === 'GET' && req.url === '/api/plugins') {
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ plugins: listCurrentPlugins() }));
-      return;
-    }
-
-    if (req.method === 'POST' && req.url === '/api/invoke') {
-      let body = '';
-      req.on('data', (chunk) => {
-        body += chunk.toString();
-      });
-      req.on('end', async () => {
-        try {
-          const payload = JSON.parse(body || '{}');
-          const result = await invokePluginChain(payload.names || payload.chain, payload.input);
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify(result));
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'unknown error';
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ error: message }));
-        }
-      });
-      return;
-    }
-
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderHtml());
   });
@@ -840,7 +762,7 @@ function startLoopbackServer(instanceId) {
 const pluginMeshCanvas = createCanvas({
   id: "plugin-mesh",
   displayName: "Copilot Mesh",
-  description: "Pair Copilot nodes, review incoming task requests, and run local plugin chains.",
+  description: "Pair Copilot nodes and review incoming task requests.",
   actions: [
     {
       name: "mesh_status",
@@ -991,7 +913,7 @@ extensionSession = await joinSession({
   canvases: [pluginMeshCanvas],
   hooks: {
     onSessionStart: async () => ({
-      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically, but control and outbound task dispatch require manual pairing. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions keep tools available by default, matching DSH's workspace-write permission preset; set COPILOT_MESH_TASK_TOOLS=none to run them without tools. A completed task is returned to the sender once as a normal answer with noWake false, matching DSH's rule that only pure receipts carry noWake, and a receipt is never answered again. A peer that marks its answer noWake anyway is still woken when it matches an unanswered outbound task of ours. Unmatched noWake notices, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
+      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically; outbound task dispatch follows dsh-plugin-mesh, so a discovered peer is dispatchable while the requirePairing switch is off, and only mesh control endpoints always need a pairing token. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions keep tools available by default, matching DSH's workspace-write permission preset; set COPILOT_MESH_TASK_TOOLS=none to run them without tools. A completed task is returned to the sender once as a normal answer with noWake false, matching DSH's rule that only pure receipts carry noWake, and a receipt is never answered again. A peer that marks its answer noWake anyway is still woken when it matches an unanswered outbound task of ours. Unmatched noWake notices, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, toggle the pairing switch, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
     }),
     onSessionEnd: async () => {
       if (meshListenRetryTimer) clearInterval(meshListenRetryTimer);

@@ -776,3 +776,233 @@ test("a mesh runtime can take over its port after the previous owner exits", asy
   assert.equal(health.status, 200);
   assert.equal((await health.json()).nodeId, runtime.state.nodeId);
 });
+
+test("a discovered peer accepts a task without pairing, like dsh-plugin-mesh", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
+  const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const receiverPort = await receiver.listen();
+  await sender.listen();
+
+  // Discovery alone is the target list; nothing was paired in either direction.
+  sender.state.discovered.push({
+    nodeId: receiver.state.nodeId,
+    name: "Discovered node",
+    host: "127.0.0.1",
+    port: receiverPort,
+    status: "online",
+    lastSeen: Date.now(),
+    capabilities: null,
+    capabilitiesAt: 0,
+  });
+  await sender.persist();
+  assert.deepEqual(sender.localState().peers, []);
+
+  const sent = await sender.sendTask({
+    peerId: receiver.state.nodeId,
+    task: "Report the free disk space on this machine.",
+    thread: "discovered-dispatch",
+  });
+  assert.equal(sent.accepted, true);
+
+  const sentRecord = sender.localState().sent.at(-1);
+  assert.equal(sentRecord.paired, false);
+  assert.equal(sentRecord.peerName, "Discovered node");
+
+  const inbox = receiver.localState().inbox;
+  assert.equal(inbox.length, 1);
+  assert.equal(inbox[0].task, "Report the free disk space on this machine.");
+  assert.equal(inbox[0].authenticated, false);
+  assert.equal(receiver.localState().requirePairing, false);
+});
+
+test("the pairing switch closes the unauthenticated task door but keeps token dispatch working", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const runtime = createMeshRuntime({ copilotHome: home, port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await runtime.initialize();
+  const port = await runtime.listen();
+  const token = runtime.localState({ includeToken: true }).token;
+  const postTask = (id, authToken) => fetch(`http://127.0.0.1:${port}/mesh/v1/task`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(authToken ? { "X-Dsh-Mesh-Token": authToken } : {}),
+    },
+    body: JSON.stringify({ id, fromName: "Peer", task: "Report the free disk space on this machine." }),
+  });
+
+  assert.equal((await postTask("pairing-off")).status, 200);
+  assert.deepEqual(await runtime.setRequirePairing(true), { requirePairing: true });
+  assert.equal(runtime.localState().requirePairing, true);
+  assert.equal((await postTask("pairing-on-anonymous")).status, 403);
+  assert.equal((await postTask("pairing-on-token", token)).status, 200);
+
+  const health = await (await fetch(`http://127.0.0.1:${port}/mesh/v1/health`)).json();
+  assert.equal(health.requirePairing, true);
+  assert.equal(health.requirePairingPinned, false);
+
+  await assert.rejects(runtime.setRequirePairing("yes"), /must be a boolean/);
+});
+
+test("a noWake receipt that reuses our task ID as its thread still wakes the sender", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const dispatches = [];
+  const sender = createMeshRuntime({
+    copilotHome: resolve(home, "sender"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task) => {
+      dispatches.push(task.id);
+      return { sessionId: "session-receipt", result: "Handled the receipt.", toolPolicy: "all" };
+    },
+  });
+  const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  const receiverPort = await receiver.listen();
+  const peer = await sender.addPeer({
+    name: "dsh style node",
+    url: `http://127.0.0.1:${receiverPort}`,
+    token: receiver.localState({ includeToken: true }).token,
+  });
+
+  // A blank thread is filled in like dsh does (`ui-${id}`), so both ends agree
+  // on a binding key even when the user leaves the field empty.
+  const sent = await sender.sendTask({ peerId: peer.id, task: "Report the free disk space on this machine." });
+  const outbound = sender.localState().sent.at(-1);
+  assert.equal(outbound.thread, `ui-${sent.id}`);
+
+  // dsh replies with noWake and uses the peer's task ID as the thread fallback.
+  const reply = await fetch(`http://127.0.0.1:${senderPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: `${sent.id}:reply`,
+      fromName: "dsh style node",
+      fromMachine: "dsh style node",
+      thread: sent.id,
+      noWake: true,
+      task: "df -h /data: 37G available out of 228G.",
+    }),
+  });
+  assert.equal(reply.status, 200);
+  assert.equal((await reply.json()).status, "dispatching");
+
+  for (let attempt = 0; attempt < 50 && dispatches.length === 0; attempt += 1) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  assert.deepEqual(dispatches, [`${sent.id}:reply`]);
+
+  const receipt = sender.localState().inbox.find((entry) => entry.id === `${sent.id}:reply`);
+  assert.equal(receipt.status, "completed");
+  // isReply wins over the noWake flag, so the receipt still wakes us.
+  assert.equal(receipt.wakeOverride, "noWake");
+  assert.equal(receipt.replyToTaskId, sent.id);
+  assert.ok(sender.localState().sent.at(-1).repliedAt);
+});
+
+test("a dispatch opens its local conversation first and the answer lands in it", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const opened = [];
+  const dispatched = [];
+  const sender = createMeshRuntime({
+    copilotHome: resolve(home, "sender"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    conversationOpener: async (record, context) => {
+      opened.push({ id: record.id, peerName: record.peerName, task: record.task, createSession: context.createSession });
+      await context.onSessionCreated("conversation-1");
+      return { sessionId: "conversation-1" };
+    },
+    taskDispatcher: async (task, context) => {
+      dispatched.push({ id: task.id, sessionId: context.sessionId, createSession: context.createSession });
+      return { sessionId: context.sessionId, result: "Relayed the answer.", toolPolicy: "all" };
+    },
+  });
+  const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  const receiverPort = await receiver.listen();
+  const peer = await sender.addPeer({
+    name: "conversation peer",
+    url: `http://127.0.0.1:${receiverPort}`,
+    token: receiver.localState({ includeToken: true }).token,
+  });
+
+  const sent = await sender.sendTask({ peerId: peer.id, task: "Report the free disk space on this machine." });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].id, sent.id);
+  assert.equal(opened[0].peerName, "conversation peer");
+  assert.equal(opened[0].createSession, true);
+  const record = sender.localState().sent.at(-1);
+  assert.equal(record.conversationSessionId, "conversation-1");
+
+  // A blank thread is a new conversation, exactly like dsh (`ui-${id}`), while
+  // an explicit thread continues the one already bound to it.
+  await sender.sendTask({ peerId: peer.id, task: "Now report the memory headroom too." });
+  assert.equal(opened.length, 2);
+  assert.equal(opened[1].createSession, true);
+  await sender.sendTask({
+    peerId: peer.id,
+    task: "Follow up in the same conversation.",
+    thread: record.thread,
+  });
+  assert.equal(opened.length, 3);
+  assert.equal(opened[2].createSession, false);
+
+  // The peer answers on the generated thread; the answer is appended to the
+  // conversation that holds the request.
+  const reply = await fetch(`http://127.0.0.1:${senderPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: `${sent.id}:answer`,
+      fromName: "conversation peer",
+      fromMachine: "conversation peer",
+      thread: record.thread,
+      noWake: true,
+      task: "df -h /data: 37G available out of 228G.",
+    }),
+  });
+  assert.equal(reply.status, 200);
+  for (let attempt = 0; attempt < 50 && dispatched.length === 0; attempt += 1) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].sessionId, "conversation-1");
+  assert.equal(dispatched[0].createSession, false);
+
+  // A noWake delivery expects no answer, so it opens no conversation.
+  await sender.sendTask({ peerId: peer.id, task: "Store this notice without waking anyone.", noWake: true });
+  assert.equal(opened.length, 3);
+  assert.equal(sender.localState().sent.at(0).conversationSkipped, "noWake deliveries expect no answer.");
+});

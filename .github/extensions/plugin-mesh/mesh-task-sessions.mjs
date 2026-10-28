@@ -69,6 +69,9 @@ async function createClient(options) {
 }
 
 function sessionName(task) {
+  if (typeof task.sessionName === "string" && task.sessionName.trim().length > 0) {
+    return task.sessionName.trim().slice(0, 120);
+  }
   const origin = (task.fromName || "peer").replace(/[\u0000-\u001f\u007f"]/g, " ").trim().slice(0, 40);
   const thread = (task.thread || task.id).replace(/[\u0000-\u001f\u007f"]/g, " ").trim().slice(0, 40);
   return `Mesh · ${origin || "peer"} · ${thread || task.id}`;
@@ -170,6 +173,21 @@ function taskPrompt(task, toolPolicy) {
     .join("\n");
 }
 
+// A dispatch opens its local conversation before the peer is contacted, so the
+// request and the answer share one transcript. The turn only records the
+// outbound message; it is not work for the local agent to carry out. The
+// closing line is what stops the agent treating the quoted request as a local
+// task, which dsh-plugin-mesh reports happening without it.
+function outboundPrompt(record) {
+  const peer = record.peerName || "peer";
+  return [
+    `向 ${peer} 发送的消息 如下:`,
+    String(record.task ?? ""),
+    "———",
+    `[Mesh 已派发 → ${peer}／${record.id}] 现在什么都不用做：不要调用任何工具、不要回派，回一句「等待回执」即可。`,
+  ].join("\n");
+}
+
 export function createMeshTaskSessionManager(options = {}) {
   const workingDirectory = options.workingDirectory || defaultWorkingDirectory();
   const baseDirectory = options.baseDirectory || copilotHome();
@@ -267,6 +285,26 @@ export function createMeshTaskSessionManager(options = {}) {
     }
   }
 
+  // Mirrors dispatch, but the prompt is a record rather than a task, and the
+  // session is reused so repeated dispatches to one peer and thread build a
+  // single conversation.
+  async function openConversation(record, context) {
+    const toolPolicy = resolveToolPolicy();
+    const previous = queues.get(context.routeKey) || Promise.resolve();
+    const current = previous.catch(() => {}).then(async () => {
+      const session = await resumeOrCreate(record, context, toolPolicy);
+      await context.onSessionCreated(session.sessionId);
+      await session.sendAndWait({ prompt: outboundPrompt(record) }, 120_000);
+      return { sessionId: session.sessionId, toolPolicy };
+    });
+    queues.set(context.routeKey, current);
+    try {
+      return await current;
+    } finally {
+      if (queues.get(context.routeKey) === current) queues.delete(context.routeKey);
+    }
+  }
+
   async function close() {
     closed = true;
     const sessions = [...new Set(sessionsById.values())];
@@ -281,5 +319,5 @@ export function createMeshTaskSessionManager(options = {}) {
     }
   }
 
-  return { dispatch, close };
+  return { dispatch, openConversation, close };
 }

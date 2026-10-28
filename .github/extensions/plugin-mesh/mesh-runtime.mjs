@@ -168,6 +168,7 @@ export class MeshRuntime {
     discoveryPort = MULTICAST_PORT,
     peerPortWindow = PEER_PORT_WINDOW,
     taskDispatcher,
+    conversationOpener,
     now = Date.now,
     onError,
   }) {
@@ -187,6 +188,7 @@ export class MeshRuntime {
     this.capabilities = null;
     this.discoveryError = "";
     this.taskDispatcher = taskDispatcher;
+    this.conversationOpener = conversationOpener;
     this.now = now;
     this.onError = onError;
     this.backgroundTasks = new Set();
@@ -214,6 +216,7 @@ export class MeshRuntime {
             : saved.nodeId,
         name: saved.name,
         token: saved.token,
+        requirePairing: saved.requirePairing === true,
         peers: saved.peers,
         discovered: Array.isArray(saved.discovered) ? saved.discovered.slice(-MAX_HISTORY) : [],
         inbox: saved.inbox.slice(-MAX_HISTORY),
@@ -252,6 +255,7 @@ export class MeshRuntime {
         instanceId: null,
         name: hostname().slice(0, 32) || "Copilot node",
         token: randomBytes(32).toString("base64url"),
+        requirePairing: false,
         peers: [],
         discovered: [],
         inbox: [],
@@ -354,6 +358,16 @@ export class MeshRuntime {
     return { name: this.state.name };
   }
 
+  async setRequirePairing(required) {
+    if (typeof required !== "boolean") {
+      throw new Error("requirePairing must be a boolean.");
+    }
+    this.state.requirePairing = required;
+    await this.persist();
+    this.announce();
+    return { requirePairing: required };
+  }
+
   selfRecord() {
     const capabilities = this.capabilities
       ? {
@@ -382,6 +396,10 @@ export class MeshRuntime {
       port: this.port,
       os: this.capabilities?.os || "",
       version: "1.0.0",
+      // dsh-plugin-mesh publishes its pairing switch in every card so a peer can
+      // see whether a shared token is required before dispatching.
+      requirePairing: this.state.requirePairing === true,
+      requirePairingPinned: false,
       capabilities,
       ts: Date.now(),
     };
@@ -651,7 +669,10 @@ export class MeshRuntime {
     const paired = isValidToken(requestToken, this.state.token)
       || this.state.peers.some((peer) => isValidToken(requestToken, peer.token));
     const requestAddress = request.socket.remoteAddress?.replace(/^::ffff:/, "") || "";
-    const isPrivateTaskSubmission = request.method === "POST"
+    // dsh-plugin-mesh defaults to "same LAN can dispatch": a private source may
+    // submit a task without a token, and requirePairing turns that door shut.
+    const isPrivateTaskSubmission = this.state.requirePairing !== true
+      && request.method === "POST"
       && url.pathname === `${API_PREFIX}/task`
       && isPrivateAddress(requestAddress);
     if (request.method === "GET" && url.pathname === `${API_PREFIX}/hello`) {
@@ -782,6 +803,7 @@ export class MeshRuntime {
       ...(includeToken ? { token: this.state.token } : {}),
       port: this.port,
       addresses: localAddresses(),
+      requirePairing: this.state.requirePairing === true,
       capabilities: this.capabilities,
       discoveryError: this.discoveryError,
       discovered: this.state.discovered.map((peer) => ({
@@ -909,20 +931,41 @@ export class MeshRuntime {
   }
 
   async sendTask({ peerId, task, thread = "", noWake = false }) {
-    const peer = this.state.peers.find((item) => item.id === peerId);
-    if (!peer) throw new Error("Peer not found. Add and pair it first.");
+    // dsh-plugin-mesh dispatches to whatever the discovery table knows; a paired
+    // peer is only preferred because it carries the peer's own token. An
+    // unpaired LAN node gets our token, which is exactly what its inbound
+    // policy accepts unless it turned requirePairing on.
+    const paired = this.state.peers.find((item) => item.id === peerId || item.nodeId === peerId);
+    const discovered = paired
+      ? null
+      : this.state.discovered.find((item) => item.nodeId === peerId || item.id === peerId);
+    if (!paired && !discovered) throw new Error("Peer not found. Discover it or pair it first.");
+    const target = paired
+      ? { id: paired.id, name: paired.name, url: paired.url, token: paired.token }
+      : {
+        id: discovered.nodeId,
+        name: discovered.name,
+        url: `http://${discovered.host.includes(":") ? `[${discovered.host}]` : discovered.host}:${discovered.port}`,
+        token: this.state.token,
+      };
     if (typeof task !== "string" || task.trim().length === 0) throw new Error("Task text is required.");
     if (Buffer.byteLength(task, "utf8") > MAX_TASK_LENGTH) throw new Error("Task text exceeds 256 KiB.");
     if (typeof thread !== "string" || thread.length > 128) throw new Error("Thread must be at most 128 characters.");
     if (typeof noWake !== "boolean") throw new Error("noWake must be a boolean.");
 
     const id = `t-${randomBytes(12).toString("hex")}`;
+    // dsh-plugin-mesh generates a thread when the UI leaves it blank, because a
+    // threadless dispatch has no binding key: the peer falls back to the task ID
+    // as its thread, our key never matches, and the answer can only open a new
+    // session. Generating one keeps both ends on the same key.
+    const threadLabel = thread || `ui-${id}`;
     const record = {
       id,
-      peerId: peer.id,
-      peerName: peer.name,
+      peerId: target.id,
+      peerName: target.name,
+      paired: Boolean(paired),
       task,
-      thread,
+      thread: threadLabel,
       noWake,
       sentAt: new Date().toISOString(),
       status: "sending",
@@ -931,12 +974,75 @@ export class MeshRuntime {
     this.state.sent = this.state.sent.slice(-MAX_HISTORY);
     await this.persist();
 
+    // Open the local conversation before contacting the peer. A reply is routed
+    // by peer address and thread, and dsh falls back to the task ID when a
+    // dispatch carries no thread, so binding that key here is what makes the
+    // answer land in this same conversation instead of a fresh session.
+    if (noWake) {
+      record.conversationSkipped = "noWake deliveries expect no answer.";
+    } else if (typeof this.conversationOpener === "function") {
+      const peerHost = paired
+        ? new URL(paired.url).hostname.replace(/^\[|\]$/g, "")
+        : String(discovered.host || "").replace(/^\[|\]$/g, "");
+      const routeKey = createHash("sha256")
+        .update(`${peerHost}\0${threadLabel}`)
+        .digest("hex");
+      const existing = this.state.routeSessions.find((entry) => entry.key === routeKey);
+      try {
+        const opened = await this.conversationOpener(
+          {
+            id,
+            fromName: target.name,
+            peerName: target.name,
+            peerHost,
+            thread: threadLabel,
+            task,
+            // dsh names the pre-created dispatch session after the thread and
+            // the peer, so the transcript is recognisable in the session list.
+            sessionName: `Mesh 派发 ${threadLabel.slice(0, 16)} → ${target.name}`,
+          },
+          {
+            routeKey,
+            sessionId: existing?.sessionId ?? null,
+            createSession: !existing?.sessionId,
+            onSessionCreated: async (sessionId) => {
+              if (typeof sessionId !== "string" || sessionId.length === 0) {
+                throw new Error("Mesh conversation opener returned an invalid session ID.");
+              }
+              const route = this.state.routeSessions.find((entry) => entry.key === routeKey);
+              if (route) {
+                route.sessionId = sessionId;
+                route.lastUsedAt = this.now();
+              } else {
+                this.state.routeSessions.push({
+                  key: routeKey,
+                  sessionId,
+                  createdAt: this.now(),
+                  lastUsedAt: this.now(),
+                });
+              }
+              this.state.routeSessions = this.state.routeSessions.slice(-MAX_HISTORY);
+              record.conversationSessionId = sessionId;
+              await this.persist();
+            },
+          },
+        );
+        if (opened && typeof opened.sessionId === "string" && opened.sessionId.length > 0) {
+          record.conversationSessionId = opened.sessionId;
+        }
+      } catch (error) {
+        // The peer is still worth contacting: a missing local transcript must
+        // not stop the dispatch.
+        record.conversationError = error.message;
+      }
+    }
+
     try {
-      const response = await fetch(`${peer.url}${API_PREFIX}/task`, {
+      const response = await fetch(`${target.url}${API_PREFIX}/task`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Dsh-Mesh-Token": peer.token,
+          "X-Dsh-Mesh-Token": target.token,
         },
         body: JSON.stringify({
           id,
@@ -945,20 +1051,30 @@ export class MeshRuntime {
           fromMachine: this.state.name,
           from: this.state.name,
           fromPort: this.port,
-          thread: thread || undefined,
+          thread: threadLabel,
           noWake,
           task,
         }),
         signal: AbortSignal.timeout(8000),
       });
       const result = await response.json();
-      if (!response.ok || !result.ok) throw new Error(result.error || `Peer rejected the task (${response.status}).`);
+      if (!response.ok || !result.ok) {
+        const hint = response.status === 403 && !paired
+          ? " The peer requires a pairing token; pair it from this canvas and dispatch again."
+          : "";
+        throw new Error((result.error || `Peer rejected the task (${response.status}).`) + hint);
+      }
       record.status = result.duplicate
         ? "already-received"
         : ["awaiting-review", "noted-only"].includes(result.status) ? "accepted-for-review" : "accepted";
       record.response = result.status;
-      peer.status = "online";
-      peer.lastSeen = new Date().toISOString();
+      if (paired) {
+        paired.status = "online";
+        paired.lastSeen = new Date().toISOString();
+      } else {
+        discovered.status = "online";
+        discovered.lastSeen = Date.now();
+      }
       await this.persist();
       return {
         accepted: true,
@@ -1075,7 +1191,11 @@ export class MeshRuntime {
     for (let index = this.state.sent.length - 1; index >= 0; index -= 1) {
       const entry = this.state.sent[index];
       if (entry.repliedAt) continue;
-      if (String(entry.thread || "") !== thread) continue;
+      // dsh-plugin-mesh falls back to the task ID as the thread when the sender
+      // supplies none (`lib/index.js`: the receipt's thread is the peer's task
+      // ID). Our outbound thread is empty in that case, so matching only on
+      // thread equality would file every such answer as an unread notice.
+      if (String(entry.thread || "") !== thread && entry.id !== thread) continue;
       if (String(entry.peerName || "") !== from) continue;
       answered = entry;
       break;
@@ -1265,6 +1385,7 @@ export function createMeshRuntime({
   discoveryGroup,
   discoveryPort,
   taskDispatcher,
+  conversationOpener,
   now,
   onError,
 } = {}) {
@@ -1276,6 +1397,7 @@ export function createMeshRuntime({
     ...(discoveryGroup === undefined ? {} : { discoveryGroup }),
     ...(discoveryPort === undefined ? {} : { discoveryPort }),
     ...(taskDispatcher === undefined ? {} : { taskDispatcher }),
+    ...(conversationOpener === undefined ? {} : { conversationOpener }),
     ...(now === undefined ? {} : { now }),
     ...(onError === undefined ? {} : { onError }),
   });
