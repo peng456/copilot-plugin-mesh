@@ -28,6 +28,7 @@ Pairing is required to read mesh control endpoints and to add outbound peers. Pr
 - The Copilot adapter does not provide a `mesh_run` agent tool; task sessions cannot invoke mesh tools. Pairing, scanning, and outbound task dispatch remain user-driven canvas actions.
 - Because there is no `mesh_run` tool, the reference's "agent dispatches its own answer with `mesh_run`" becomes a runtime step: a completed task is posted back once with `noWake: true`. The observable policy is the same — one answer per task, and receipts are never answered.
 - The reference's configurable scan ranges/ports and full cross-session reply binding are not implemented.
+- The reference finds a reply route by looking the sender up in its own peer table by machine name. Android peers do not multicast and `dsh-mesh` sends no port, so a sender can be missing from that table entirely. Here the reply route is resolved from the sender's node id or machine name, and when the sender is unknown the inbound address is asked for its own `/health` across a narrow port window around the default port. A reply is never routed on host address alone, because two mesh nodes commonly share one machine.
 - `permissionPreset` is mapped to `sandboxConfig` rather than a preset name, so the task session's sandbox is `workspace-write`-shaped but fixed: there is no `read-only` or `full-access` setting to select, only `COPILOT_MESH_TASK_TOOLS=none` to drop tools entirely.
 
 ## Pair and use

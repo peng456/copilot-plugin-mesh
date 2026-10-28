@@ -486,3 +486,107 @@ test("an answer to our own outbound task is treated as a receipt and not answere
     "a receipt must not be answered again",
   );
 });
+
+test("a reply reaches a sender that does not announce a port", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
+  const receiver = createMeshRuntime({
+    copilotHome: resolve(home, "receiver"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-probe";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `Answer for ${task.id}` };
+    },
+  });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  // dsh-mesh omits its port and Android nodes never multicast, so the receiver
+  // can only learn the route by asking the sending address.
+  receiver.peerPortWindow = { from: senderPort, to: senderPort };
+  const receiverPort = await receiver.listen();
+
+  await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "probe-1",
+      task: "Please answer this task without a sender port.",
+      thread: "probe-thread",
+      fromMachine: sender.localState().name,
+    }),
+  });
+
+  let task;
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    task = receiver.localState().inbox.find((entry) => entry.id === "probe-1");
+    if (task?.status === "completed" && task.replyStatus) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(task.status, "completed");
+  assert.equal(task.replyStatus, "delivered");
+  const delivered = sender.localState().inbox.find((entry) => entry.id === "probe-1:reply");
+  assert.ok(delivered, "the probed sender should receive the answer");
+  assert.equal(delivered.task, "Answer for probe-1");
+});
+
+test("a reply is never routed to a mesh node that is not the sender", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const stranger = createMeshRuntime({ copilotHome: resolve(home, "stranger"), port: 0, host: "127.0.0.1", discovery: false });
+  const receiver = createMeshRuntime({
+    copilotHome: resolve(home, "receiver"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    taskDispatcher: async (task, context) => {
+      const sessionId = context.sessionId || "session-stranger";
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `Answer for ${task.id}` };
+    },
+  });
+  t.after(async () => {
+    await stranger.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await stranger.initialize();
+  await receiver.initialize();
+  const strangerPort = await stranger.listen();
+  receiver.peerPortWindow = { from: strangerPort, to: strangerPort };
+  const receiverPort = await receiver.listen();
+
+  await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "ghost-1",
+      task: "This claims to come from a node that is not listening here.",
+      thread: "ghost-thread",
+      fromMachine: "ghost-node",
+    }),
+  });
+
+  let task;
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    task = receiver.localState().inbox.find((entry) => entry.id === "ghost-1");
+    if (task?.status === "completed" && task.replyStatus) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(task.status, "completed");
+  assert.equal(task.replyStatus, "no-route");
+  assert.equal(
+    stranger.localState().inbox.find((entry) => entry.id === "ghost-1:reply"),
+    undefined,
+    "an unrelated node must not receive the answer",
+  );
+});

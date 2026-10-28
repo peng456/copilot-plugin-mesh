@@ -19,6 +19,9 @@ const MAX_WAKES_PER_THREAD = 30;
 const MULTICAST_GROUP = "239.255.42.99";
 const MULTICAST_PORT = 45892;
 const DEFAULT_PEER_PORT = 45917;
+// Peers pick a nearby port when the default is taken, and dsh-mesh sends no
+// port in its task payload, so a reply has to search this window.
+const PEER_PORT_WINDOW = { from: DEFAULT_PEER_PORT - 20, to: DEFAULT_PEER_PORT + 60 };
 const PEER_TTL_MS = 20_000;
 const PEER_KEEP_MS = 5 * 60_000;
 const NOTICE_ONLY_PATTERN = /^(?:hi|hello|hey|good morning|good afternoon|good evening|thanks|thank you|ok|okay|got it|understood|你好|您好|嗨|收到|好的|谢谢|感谢|明白了)[\s.!?,，。！？~～]*$/iu;
@@ -163,6 +166,7 @@ export class MeshRuntime {
     discovery = true,
     discoveryGroup = MULTICAST_GROUP,
     discoveryPort = MULTICAST_PORT,
+    peerPortWindow = PEER_PORT_WINDOW,
     taskDispatcher,
     now = Date.now,
     onError,
@@ -173,6 +177,7 @@ export class MeshRuntime {
     this.discoveryEnabled = discovery;
     this.discoveryGroup = discoveryGroup;
     this.discoveryPort = discoveryPort;
+    this.peerPortWindow = peerPortWindow;
     this.state = null;
     this.server = null;
     this.port = null;
@@ -1046,15 +1051,74 @@ export class MeshRuntime {
     );
   }
 
-  replyTarget(task) {
+  // dsh-plugin-mesh resolves a reply by machine name from its peer table, but
+  // dsh-mesh never sends its port and Android nodes do not multicast, so the
+  // sender is often absent from that table. The inbound connection still proves
+  // the address, so ask it for its own health record across the mesh port window
+  // and remember the answer.
+  async replyTarget(task) {
     const host = task.replyTo?.host;
     if (typeof host !== "string" || !isPrivateAddress(host)) return null;
     if (Number.isInteger(task.replyTo.port) && task.replyTo.port > 0) {
       return { host, port: task.replyTo.port };
     }
-    const known = [...this.state.peers, ...this.state.discovered]
-      .find((peer) => peer.host === host && Number.isInteger(peer.port));
-    return known ? { host, port: known.port } : null;
+    const machine = task.replyTo?.machine || task.fromMachine || "";
+    const nodeId = task.fromNodeId && task.fromNodeId !== "unknown" ? task.fromNodeId : "";
+    // Without a name or node id a probed node cannot be proven to be the sender,
+    // so never guess a route for it.
+    if (!machine && !nodeId) return null;
+    // Match on identity, never on host alone: two mesh nodes often share one
+    // machine, and the wrong one must not be handed the answer.
+    const known = [...this.state.peers, ...this.state.discovered].find(
+      (peer) => Number.isInteger(peer.port)
+        && (nodeId ? peer.nodeId === nodeId : peer.name === machine),
+    );
+    if (known) return { host: known.host || host, port: known.port };
+    return this.probeReplyPort(host, machine, nodeId);
+  }
+
+  async probeReplyPort(host, machine, nodeId) {
+    const ports = [];
+    for (let port = this.peerPortWindow.from; port <= this.peerPortWindow.to; port++) {
+      if (port !== this.port) ports.push(port);
+    }
+    ports.sort((left, right) => Math.abs(left - DEFAULT_PEER_PORT) - Math.abs(right - DEFAULT_PEER_PORT));
+    const queue = [...ports];
+    let found = null;
+    const worker = async () => {
+      while (queue.length && !found) {
+        const port = queue.shift();
+        const target = host.includes(":") ? `[${host}]` : host;
+        try {
+          const response = await fetch(`http://${target}:${port}${API_PREFIX}/health`, {
+            signal: AbortSignal.timeout(700),
+          });
+          if (!response.ok) continue;
+          const record = await response.json();
+          const peerId = record.id || record.instanceId || record.nodeId;
+          if (!["dsh-mesh", "copilot-plugin-mesh"].includes(record.app) || typeof peerId !== "string") continue;
+          if (peerId === this.state.nodeId) continue;
+          // The sender is identified by node id when it sent one; otherwise the
+          // machine name must match, so an unrelated mesh node is never answered.
+          if (nodeId ? peerId !== nodeId : record.machine !== machine) continue;
+          found = {
+            nodeId: peerId,
+            name: String(record.machine || record.name || machine || host).slice(0, 32),
+            host,
+            port: Number.isInteger(record.port) ? record.port : port,
+            capabilities: sanitizeCapabilities(record.capabilities),
+            capabilitiesAt: 0,
+          };
+        } catch {
+          continue;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(32, queue.length) }, () => worker()));
+    if (!found) return null;
+    this.observePeer({ ...found, lastSeen: Date.now(), paired: this.state.peers.some((peer) => peer.nodeId === found.nodeId) });
+    this.persist().catch(() => {});
+    return { host, port: found.port };
   }
 
   async deliverReply(task) {
@@ -1063,7 +1127,7 @@ export class MeshRuntime {
       task.replyStatus = "skipped-reply";
       return;
     }
-    const target = this.replyTarget(task);
+    const target = await this.replyTarget(task);
     if (!target) {
       task.replyStatus = "no-route";
       return;
