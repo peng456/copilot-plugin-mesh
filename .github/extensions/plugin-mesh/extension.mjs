@@ -503,7 +503,7 @@ function renderHtml() {
             if (inbox && task.result) {
               const result = document.createElement("pre");
               result.className = "task-text";
-              result.textContent = "隔离会话回复：\n" + task.result;
+              result.textContent = "隔离会话回复：\\n" + task.result;
               card.append(result);
             }
             if (inbox && ["awaiting-review", "failed", "rate-limited"].includes(task.status)) {
