@@ -538,7 +538,7 @@ export class MeshRuntime {
       capabilities: sanitizeCapabilities(record.capabilities),
       capabilitiesAt: Number.isFinite(record.capabilities?.capabilitiesAt) ? record.capabilities.capabilitiesAt : 0,
       lastSeen: Date.now(),
-      paired: false,
+      paired: this.state.peers.some((item) => item.nodeId === peer.nodeId),
     });
     return true;
   }
