@@ -214,6 +214,7 @@ export class MeshRuntime {
             : saved.nodeId,
         name: saved.name,
         token: saved.token,
+        requirePairing: saved.requirePairing === true,
         peers: saved.peers,
         discovered: Array.isArray(saved.discovered) ? saved.discovered.slice(-MAX_HISTORY) : [],
         inbox: saved.inbox.slice(-MAX_HISTORY),
@@ -252,6 +253,7 @@ export class MeshRuntime {
         instanceId: null,
         name: hostname().slice(0, 32) || "Copilot node",
         token: randomBytes(32).toString("base64url"),
+        requirePairing: false,
         peers: [],
         discovered: [],
         inbox: [],
@@ -354,6 +356,16 @@ export class MeshRuntime {
     return { name: this.state.name };
   }
 
+  async setRequirePairing(required) {
+    if (typeof required !== "boolean") {
+      throw new Error("requirePairing must be a boolean.");
+    }
+    this.state.requirePairing = required;
+    await this.persist();
+    this.announce();
+    return { requirePairing: required };
+  }
+
   selfRecord() {
     const capabilities = this.capabilities
       ? {
@@ -382,6 +394,10 @@ export class MeshRuntime {
       port: this.port,
       os: this.capabilities?.os || "",
       version: "1.0.0",
+      // dsh-plugin-mesh publishes its pairing switch in every card so a peer can
+      // see whether a shared token is required before dispatching.
+      requirePairing: this.state.requirePairing === true,
+      requirePairingPinned: false,
       capabilities,
       ts: Date.now(),
     };
@@ -651,7 +667,10 @@ export class MeshRuntime {
     const paired = isValidToken(requestToken, this.state.token)
       || this.state.peers.some((peer) => isValidToken(requestToken, peer.token));
     const requestAddress = request.socket.remoteAddress?.replace(/^::ffff:/, "") || "";
-    const isPrivateTaskSubmission = request.method === "POST"
+    // dsh-plugin-mesh defaults to "same LAN can dispatch": a private source may
+    // submit a task without a token, and requirePairing turns that door shut.
+    const isPrivateTaskSubmission = this.state.requirePairing !== true
+      && request.method === "POST"
       && url.pathname === `${API_PREFIX}/task`
       && isPrivateAddress(requestAddress);
     if (request.method === "GET" && url.pathname === `${API_PREFIX}/hello`) {
@@ -782,6 +801,7 @@ export class MeshRuntime {
       ...(includeToken ? { token: this.state.token } : {}),
       port: this.port,
       addresses: localAddresses(),
+      requirePairing: this.state.requirePairing === true,
       capabilities: this.capabilities,
       discoveryError: this.discoveryError,
       discovered: this.state.discovered.map((peer) => ({
@@ -909,8 +929,23 @@ export class MeshRuntime {
   }
 
   async sendTask({ peerId, task, thread = "", noWake = false }) {
-    const peer = this.state.peers.find((item) => item.id === peerId);
-    if (!peer) throw new Error("Peer not found. Add and pair it first.");
+    // dsh-plugin-mesh dispatches to whatever the discovery table knows; a paired
+    // peer is only preferred because it carries the peer's own token. An
+    // unpaired LAN node gets our token, which is exactly what its inbound
+    // policy accepts unless it turned requirePairing on.
+    const paired = this.state.peers.find((item) => item.id === peerId || item.nodeId === peerId);
+    const discovered = paired
+      ? null
+      : this.state.discovered.find((item) => item.nodeId === peerId || item.id === peerId);
+    if (!paired && !discovered) throw new Error("Peer not found. Discover it or pair it first.");
+    const target = paired
+      ? { id: paired.id, name: paired.name, url: paired.url, token: paired.token }
+      : {
+        id: discovered.nodeId,
+        name: discovered.name,
+        url: `http://${discovered.host.includes(":") ? `[${discovered.host}]` : discovered.host}:${discovered.port}`,
+        token: this.state.token,
+      };
     if (typeof task !== "string" || task.trim().length === 0) throw new Error("Task text is required.");
     if (Buffer.byteLength(task, "utf8") > MAX_TASK_LENGTH) throw new Error("Task text exceeds 256 KiB.");
     if (typeof thread !== "string" || thread.length > 128) throw new Error("Thread must be at most 128 characters.");
@@ -919,8 +954,9 @@ export class MeshRuntime {
     const id = `t-${randomBytes(12).toString("hex")}`;
     const record = {
       id,
-      peerId: peer.id,
-      peerName: peer.name,
+      peerId: target.id,
+      peerName: target.name,
+      paired: Boolean(paired),
       task,
       thread,
       noWake,
@@ -932,11 +968,11 @@ export class MeshRuntime {
     await this.persist();
 
     try {
-      const response = await fetch(`${peer.url}${API_PREFIX}/task`, {
+      const response = await fetch(`${target.url}${API_PREFIX}/task`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Dsh-Mesh-Token": peer.token,
+          "X-Dsh-Mesh-Token": target.token,
         },
         body: JSON.stringify({
           id,
@@ -952,13 +988,23 @@ export class MeshRuntime {
         signal: AbortSignal.timeout(8000),
       });
       const result = await response.json();
-      if (!response.ok || !result.ok) throw new Error(result.error || `Peer rejected the task (${response.status}).`);
+      if (!response.ok || !result.ok) {
+        const hint = response.status === 403 && !paired
+          ? " The peer requires a pairing token; pair it from this canvas and dispatch again."
+          : "";
+        throw new Error((result.error || `Peer rejected the task (${response.status}).`) + hint);
+      }
       record.status = result.duplicate
         ? "already-received"
         : ["awaiting-review", "noted-only"].includes(result.status) ? "accepted-for-review" : "accepted";
       record.response = result.status;
-      peer.status = "online";
-      peer.lastSeen = new Date().toISOString();
+      if (paired) {
+        paired.status = "online";
+        paired.lastSeen = new Date().toISOString();
+      } else {
+        discovered.status = "online";
+        discovered.lastSeen = Date.now();
+      }
       await this.persist();
       return {
         accepted: true,

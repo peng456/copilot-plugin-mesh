@@ -776,3 +776,83 @@ test("a mesh runtime can take over its port after the previous owner exits", asy
   assert.equal(health.status, 200);
   assert.equal((await health.json()).nodeId, runtime.state.nodeId);
 });
+
+test("a discovered peer accepts a task without pairing, like dsh-plugin-mesh", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
+  const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const receiverPort = await receiver.listen();
+  await sender.listen();
+
+  // Discovery alone is the target list; nothing was paired in either direction.
+  sender.state.discovered.push({
+    nodeId: receiver.state.nodeId,
+    name: "Discovered node",
+    host: "127.0.0.1",
+    port: receiverPort,
+    status: "online",
+    lastSeen: Date.now(),
+    capabilities: null,
+    capabilitiesAt: 0,
+  });
+  await sender.persist();
+  assert.deepEqual(sender.localState().peers, []);
+
+  const sent = await sender.sendTask({
+    peerId: receiver.state.nodeId,
+    task: "Report the free disk space on this machine.",
+    thread: "discovered-dispatch",
+  });
+  assert.equal(sent.accepted, true);
+
+  const sentRecord = sender.localState().sent.at(-1);
+  assert.equal(sentRecord.paired, false);
+  assert.equal(sentRecord.peerName, "Discovered node");
+
+  const inbox = receiver.localState().inbox;
+  assert.equal(inbox.length, 1);
+  assert.equal(inbox[0].task, "Report the free disk space on this machine.");
+  assert.equal(inbox[0].authenticated, false);
+  assert.equal(receiver.localState().requirePairing, false);
+});
+
+test("the pairing switch closes the unauthenticated task door but keeps token dispatch working", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const runtime = createMeshRuntime({ copilotHome: home, port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await runtime.initialize();
+  const port = await runtime.listen();
+  const token = runtime.localState({ includeToken: true }).token;
+  const postTask = (id, authToken) => fetch(`http://127.0.0.1:${port}/mesh/v1/task`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(authToken ? { "X-Dsh-Mesh-Token": authToken } : {}),
+    },
+    body: JSON.stringify({ id, fromName: "Peer", task: "Report the free disk space on this machine." }),
+  });
+
+  assert.equal((await postTask("pairing-off")).status, 200);
+  assert.deepEqual(await runtime.setRequirePairing(true), { requirePairing: true });
+  assert.equal(runtime.localState().requirePairing, true);
+  assert.equal((await postTask("pairing-on-anonymous")).status, 403);
+  assert.equal((await postTask("pairing-on-token", token)).status, 200);
+
+  const health = await (await fetch(`http://127.0.0.1:${port}/mesh/v1/health`)).json();
+  assert.equal(health.requirePairing, true);
+  assert.equal(health.requirePairingPinned, false);
+
+  await assert.rejects(runtime.setRequirePairing("yes"), /must be a boolean/);
+});

@@ -265,7 +265,7 @@ function renderHtml() {
         <section class="panel" aria-labelledby="mesh-heading">
           <div class="panel-heading">
             <h2 id="mesh-heading">Copilot Mesh 节点</h2>
-            <p>自动发现同网段节点，也可手动扫描；发现不代表信任，配对仍需你提供对端令牌。</p>
+            <p>自动发现同网段节点，也可手动扫描；发现即可派发任务，配对码开关决定是否强制校验令牌。</p>
           </div>
           <div class="form">
             <div class="mesh-meta" id="mesh-meta"><div class="empty">正在读取节点状态…</div></div>
@@ -274,7 +274,9 @@ function renderHtml() {
               <code id="local-token">配对令牌已隐藏</code>
               <button class="secondary-button small-button" id="toggle-token" type="button">显示令牌</button>
             </div>
-            <div class="mesh-banner">配对令牌通过 HTTP 明文传输，仅在可信私有网络使用。收到的任务只进入待审核收件箱，不会自动发送给 Copilot 或执行。</div>
+            <label class="checkbox-field" for="require-pairing"><input id="require-pairing" type="checkbox" /><span>要求配对码（开启后未持有令牌的对端无法派发任务）</span></label>
+            <p class="capability-note" id="pairing-summary"></p>
+            <div class="mesh-banner">配对令牌通过 HTTP 明文传输，仅在可信私有网络使用。关闭配对码时，同一局域网的已发现节点可直接派发任务；收到的任务会交给独立的隔离任务会话处理，不会注入当前对话。</div>
 
             <form id="name-form" class="name-row">
               <div class="field"><label for="machine-name">本机名称</label><input id="machine-name" required maxlength="32" /></div>
@@ -401,22 +403,35 @@ function renderHtml() {
           return item;
         }
 
-        function renderPeers(peers) {
+        function renderPeers(peers, discovered = []) {
           const list = document.getElementById("peer-list");
           const select = document.getElementById("task-peer");
           const selectedPeer = select.value;
           list.replaceChildren();
           select.replaceChildren();
+          // dsh-plugin-mesh dispatches to discovered nodes too, so the target
+          // list mirrors the discovery table instead of only paired peers.
+          const dispatchable = discovered.filter((peer) =>
+            peer.status === "online" && !peers.some((item) => item.nodeId === peer.nodeId));
           const prompt = document.createElement("option");
           prompt.value = "";
-          prompt.textContent = peers.length ? "选择一个已配对节点" : "先添加并配对节点";
+          prompt.textContent = peers.length || dispatchable.length
+            ? "选择一个节点"
+            : "先发现或配对节点";
           select.append(prompt);
           for (const peer of peers) {
             const option = document.createElement("option");
             option.value = peer.id;
-            option.textContent = peer.name + " · " + peer.status;
+            option.textContent = peer.name + " · 已配对 · " + peer.status;
             select.append(option);
-
+          }
+          for (const peer of dispatchable) {
+            const option = document.createElement("option");
+            option.value = peer.nodeId;
+            option.textContent = peer.name + " · 未配对 · " + peer.status;
+            select.append(option);
+          }
+          for (const peer of peers) {
             const card = document.createElement("article");
             card.className = "peer-item";
             const head = document.createElement("div");
@@ -472,11 +487,11 @@ function renderHtml() {
             }
             list.append(card);
           }
-          if (peers.some((peer) => peer.id === selectedPeer)) select.value = selectedPeer;
+          if ([...select.options].some((option) => option.value === selectedPeer)) select.value = selectedPeer;
           if (!peers.length) {
             const empty = document.createElement("div");
             empty.className = "empty";
-            empty.textContent = "尚未配对节点。请在另一台 Copilot 上安装此扩展，并将它的私有 IP、端口和配对令牌添加到这里。";
+            empty.textContent = "尚未配对节点。可以直接向已发现的节点派发任务，或粘贴对端令牌建立配对。";
             list.append(empty);
           }
         }
@@ -505,7 +520,19 @@ function renderHtml() {
               document.getElementById("peer-url").value = "http://" + peer.host + ":" + peer.port;
               document.getElementById("peer-token").focus();
             });
-            head.append(info, pair);
+            const dispatch = document.createElement("button");
+            dispatch.className = "secondary-button small-button";
+            dispatch.type = "button";
+            dispatch.textContent = "派发任务";
+            dispatch.addEventListener("click", () => {
+              document.getElementById("task-peer").value = peer.nodeId;
+              document.getElementById("task-text").focus();
+              setMeshFeedback("已选择未配对节点 " + peer.name + "，填写任务后发送即可。");
+            });
+            const discoveredActions = document.createElement("div");
+            discoveredActions.className = "actions";
+            discoveredActions.append(dispatch, pair);
+            head.append(info, discoveredActions);
             card.append(head);
             if (peer.capabilities || peer.capabilitiesStale === null) {
               const details = document.createElement("div");
@@ -631,7 +658,13 @@ function renderHtml() {
               ? "本机能力：" + capabilities.os + " · " + capabilities.cpuCount + " CPU · " + Math.round(capabilities.memoryBytes / 1024 ** 3) + " GB RAM · " + Object.entries(capabilities.runtimes).map(([key, value]) => key + " " + value).join(" · ")
               : "本机能力暂不可用。";
             document.getElementById("local-token").textContent = tokenVisible ? meshToken : "配对令牌已隐藏";
-            renderPeers(state.peers);
+            const requirePairing = state.requirePairing === true;
+            const pairingToggle = document.getElementById("require-pairing");
+            if (document.activeElement !== pairingToggle) pairingToggle.checked = requirePairing;
+            document.getElementById("pairing-summary").textContent = requirePairing
+              ? "配对码：开 · 两端需使用同一个配对码，未配对的对端会被拒绝。"
+              : "配对码：关 · 同一局域网发现即可派发任务。";
+            renderPeers(state.peers, state.discovered);
             renderDiscovered(state.discovered);
             renderTasks("inbox-list", state.inbox, true);
             renderTasks("sent-list", state.sent);
@@ -678,6 +711,20 @@ function renderHtml() {
             setMeshFeedback("节点状态已刷新。");
           } catch (error) {
             setMeshFeedback(error.message, true);
+          }
+        });
+        document.getElementById("require-pairing").addEventListener("change", async (event) => {
+          const checkbox = event.currentTarget;
+          checkbox.disabled = true;
+          try {
+            await meshRequest("/api/mesh/pairing", { requirePairing: checkbox.checked });
+            await loadMesh();
+            setMeshFeedback(checkbox.checked ? "已开启配对码校验。" : "已关闭配对码校验，同网段发现即可派发。");
+          } catch (error) {
+            setMeshFeedback(error.message, true);
+            await loadMesh();
+          } finally {
+            checkbox.disabled = false;
           }
         });
         document.getElementById("peer-form").addEventListener("submit", async (event) => {
@@ -771,6 +818,7 @@ function startLoopbackServer(instanceId) {
 
     const meshActions = {
       "/api/mesh/name": (body) => mesh.setName(body.name),
+      "/api/mesh/pairing": (body) => mesh.setRequirePairing(body.requirePairing),
       "/api/mesh/scan": () => mesh.scan(),
       "/api/mesh/peer": (body) => mesh.addPeer(body),
       "/api/mesh/peer/remove": (body) => mesh.removePeer(body.id),
@@ -991,7 +1039,7 @@ extensionSession = await joinSession({
   canvases: [pluginMeshCanvas],
   hooks: {
     onSessionStart: async () => ({
-      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically, but control and outbound task dispatch require manual pairing. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions keep tools available by default, matching DSH's workspace-write permission preset; set COPILOT_MESH_TASK_TOOLS=none to run them without tools. A completed task is returned to the sender once as a normal answer with noWake false, matching DSH's rule that only pure receipts carry noWake, and a receipt is never answered again. A peer that marks its answer noWake anyway is still woken when it matches an unanswered outbound task of ours. Unmatched noWake notices, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
+      additionalContext: `Copilot Mesh is active. LAN peers may be discovered automatically; outbound task dispatch follows dsh-plugin-mesh, so a discovered peer is dispatchable while the requirePairing switch is off, and only mesh control endpoints always need a pairing token. Incoming tasks follow DSH Mesh wake policy and run in a separate named Copilot session; no remote task is injected into this conversation. Task sessions keep tools available by default, matching DSH's workspace-write permission preset; set COPILOT_MESH_TASK_TOOLS=none to run them without tools. A completed task is returned to the sender once as a normal answer with noWake false, matching DSH's rule that only pure receipts carry noWake, and a receipt is never answered again. A peer that marks its answer noWake anyway is still woken when it matches an unanswered outbound task of ours. Unmatched noWake notices, short notices, and thread limits may keep an incoming task in the inbox. Outgoing tasks follow DSH Mesh defaults (noWake: false unless selected). Mesh read-only actions: mesh_status, mesh_peers, and mesh_tasks. Scan, pair peers, toggle the pairing switch, and send requests manually in the Copilot Mesh canvas. Local built-in plugins: ${Object.keys(BUILTIN_PLUGINS).join(", ")}.`,
     }),
     onSessionEnd: async () => {
       if (meshListenRetryTimer) clearInterval(meshListenRetryTimer);
