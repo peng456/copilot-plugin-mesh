@@ -254,3 +254,49 @@ test("identity and discovery cards use the DSH mesh v2 wire shape", async (t) =>
   await assert.rejects(runtime.setName("bad/name"), /Machine name/);
   assert.equal((await runtime.setName("Studio Mac")).name, "Studio Mac");
 });
+
+test("state files written before DSH routing load and upgrade in place", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const storageFile = resolve(home, "extensions", "plugin-mesh", "artifacts", "mesh-state.json");
+  const legacy = {
+    version: 1,
+    nodeId: "a1b2c3d4e5f60718",
+    instanceId: "a1b2c3d4e5f60718",
+    name: "Legacy node",
+    token: "A".repeat(43),
+    peers: [],
+    discovered: [],
+    inbox: [{
+      id: "t-legacy",
+      status: "awaiting-review",
+      task: "an older task kept for review",
+      fromName: "hos",
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    }],
+    sent: [],
+  };
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  await mkdir(resolve(storageFile, ".."), { recursive: true });
+  await writeFile(storageFile, JSON.stringify(legacy));
+
+  const runtime = createMeshRuntime({ copilotHome: home, port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await runtime.initialize();
+  const state = runtime.localState();
+  assert.equal(state.nodeId, "a1b2c3d4e5f60718");
+  assert.equal(state.name, "Legacy node");
+  assert.equal(state.inbox.length, 1);
+  assert.equal(state.inbox[0].status, "awaiting-review");
+
+  await runtime.listen();
+  await runtime.persist();
+  const upgraded = JSON.parse(await readFile(storageFile, "utf8"));
+  assert.deepEqual(upgraded.routeSessions, []);
+  assert.deepEqual(upgraded.threadActivity, []);
+  assert.equal(upgraded.token, "A".repeat(43));
+  assert.equal(upgraded.inbox[0].id, "t-legacy");
+});
