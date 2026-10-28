@@ -843,7 +843,7 @@ const pluginMeshCanvas = createCanvas({
     {
       name: "mesh_status",
       description: "Show this Copilot node's identity, private addresses, and paired peers. Never returns pairing tokens.",
-      handler: async () => mesh.localState(),
+      handler: async () => ({ ...mesh.localState(), listenError: meshListenError }),
     },
     {
       name: "mesh_peers",
@@ -935,7 +935,9 @@ const pluginMeshCanvas = createCanvas({
 
     return {
       title: "Copilot Mesh",
-      status: `${mesh.localState().peers.length} paired peers · ${mesh.localState().port}`,
+      status: meshListenError
+        ? `Mesh offline · ${meshListenError}`
+        : `${mesh.localState().peers.length} paired peers · ${mesh.localState().port}`,
       url: entry.url,
     };
   },
@@ -950,7 +952,16 @@ const pluginMeshCanvas = createCanvas({
 
 ensureStorage();
 await mesh.initialize();
-await mesh.listen();
+// A second install or a leftover process can already own the mesh port. That
+// must not take the canvas down with it: report the reason and stay usable.
+let meshListenError = null;
+try {
+  await mesh.listen();
+} catch (error) {
+  meshListenError = error.code === "EADDRINUSE"
+    ? `Port ${mesh.requestedPort} is already in use by another Copilot Mesh process.`
+    : error.message;
+}
 
 extensionSession = await joinSession({
   canvases: [pluginMeshCanvas],
