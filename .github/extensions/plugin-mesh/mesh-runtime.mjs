@@ -436,6 +436,9 @@ export class MeshRuntime {
               }
             });
           }
+          this.probeDiscoveredPeers().catch((error) => {
+            this.discoveryError = error.message.slice(0, 200);
+          });
         }, 10_000);
         healthTimer.unref?.();
         this.discoveryTimers.push(healthTimer);
@@ -510,6 +513,39 @@ export class MeshRuntime {
         ...peer,
         status: now - peer.lastSeen > PEER_TTL_MS ? "offline" : "online",
       }));
+  }
+
+  async probeDiscoveredPeer(peer) {
+    const host = peer.host.includes(":") ? `[${peer.host}]` : peer.host;
+    let record;
+    try {
+      const response = await fetch(`http://${host}:${peer.port}${API_PREFIX}/health`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!response.ok) return false;
+      record = await response.json();
+    } catch {
+      return false;
+    }
+    const peerId = record.id || record.instanceId || record.nodeId;
+    if (peerId !== peer.nodeId) return false;
+    const peerName = record.machine || record.name;
+    this.observePeer({
+      nodeId: peer.nodeId,
+      name: typeof peerName === "string" ? peerName.slice(0, 32) : peer.name,
+      host: peer.host,
+      port: Number.isInteger(record.port) ? record.port : peer.port,
+      capabilities: sanitizeCapabilities(record.capabilities),
+      capabilitiesAt: Number.isFinite(record.capabilities?.capabilitiesAt) ? record.capabilities.capabilitiesAt : 0,
+      lastSeen: Date.now(),
+      paired: false,
+    });
+    return true;
+  }
+
+  async probeDiscoveredPeers() {
+    const peers = [...this.state.discovered];
+    await Promise.allSettled(peers.map((peer) => this.probeDiscoveredPeer(peer)));
   }
 
   async scan() {

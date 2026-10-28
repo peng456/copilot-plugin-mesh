@@ -300,3 +300,42 @@ test("state files written before DSH routing load and upgrade in place", async (
   assert.equal(upgraded.token, "A".repeat(43));
   assert.equal(upgraded.inbox[0].id, "t-legacy");
 });
+
+test("discovered peers stay online between full LAN scans", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const remote = createMeshRuntime({ copilotHome: resolve(home, "remote"), port: 0, host: "127.0.0.1", discovery: false });
+  const local = createMeshRuntime({ copilotHome: resolve(home, "local"), port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await remote.close();
+    await local.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await remote.initialize();
+  await remote.listen();
+  await local.initialize();
+  await local.listen();
+
+  const remoteRecord = remote.localState();
+  local.state.discovered.push({
+    nodeId: remoteRecord.nodeId,
+    name: "stale name",
+    host: "127.0.0.1",
+    port: remote.port,
+    status: "offline",
+    lastSeen: Date.now() - 120_000,
+    capabilities: null,
+    capabilitiesAt: 0,
+    paired: false,
+  });
+
+  assert.equal(await local.probeDiscoveredPeer(local.state.discovered[0]), true);
+  const [peer] = local.localState().discovered;
+  assert.equal(peer.status, "online");
+  assert.equal(peer.name, remoteRecord.name);
+  assert.ok(Date.now() - peer.lastSeen < 5_000);
+  assert.equal(peer.paired, false);
+
+  await remote.close();
+  assert.equal(await local.probeDiscoveredPeer(local.state.discovered[0]), false);
+});
