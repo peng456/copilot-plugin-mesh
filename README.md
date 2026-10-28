@@ -15,6 +15,7 @@ Copilot CLI adaptation of the node discovery, capability-card, pairing, peer hea
 - A completed task is returned to the sender once as a normal woken answer (`noWake: false`), matching DSH's rule that only pure receipts carry `noWake`, and a receipt is never answered again, so peers cannot loop. An answer that a peer still marks `noWake` is also matched against our own outbound task and woken anyway, so a reply is never silently filed as a notice.
 - Read-only agent-facing canvas actions: `mesh_status`, `mesh_peers`, and `mesh_tasks`. Peer pairing, scanning, task sending, copying, and dismissing stay user-driven canvas actions.
 - If the mesh port is already owned by a leftover process from the previous launch, the canvas stays usable, reports the reason, and the listener keeps retrying in the background, so the node rejoins the mesh on its own instead of staying invisible until the next restart.
+- Dispatching follows dsh-plugin-mesh's host-side flow: a blank 线程 becomes `ui-<task id>`, a local conversation named `Mesh 派发 <thread> → <peer>` is created *before* the peer is contacted, the outbound message is appended to it, and the conversation key is bound so the peer's answer is appended to the same transcript. A noWake delivery expects no answer, so it opens no conversation.
 - The canvas keeps only the mesh panels: node status, peers, task dispatch, and the inbox. The earlier local plugin registry and plugin-chain runner were removed; `list_plugins` and `register_plugin` remain agent actions.
 
 ## Intentional safety boundary

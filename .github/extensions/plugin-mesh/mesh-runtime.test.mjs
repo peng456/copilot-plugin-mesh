@@ -887,10 +887,11 @@ test("a noWake receipt that reuses our task ID as its thread still wakes the sen
     token: receiver.localState({ includeToken: true }).token,
   });
 
-  // Threadless dispatch, exactly like the canvas default.
+  // A blank thread is filled in like dsh does (`ui-${id}`), so both ends agree
+  // on a binding key even when the user leaves the field empty.
   const sent = await sender.sendTask({ peerId: peer.id, task: "Report the free disk space on this machine." });
   const outbound = sender.localState().sent.at(-1);
-  assert.equal(outbound.thread, "");
+  assert.equal(outbound.thread, `ui-${sent.id}`);
 
   // dsh replies with noWake and uses the peer's task ID as the thread fallback.
   const reply = await fetch(`http://127.0.0.1:${senderPort}/mesh/v1/task`, {
@@ -919,4 +920,89 @@ test("a noWake receipt that reuses our task ID as its thread still wakes the sen
   assert.equal(receipt.wakeOverride, "noWake");
   assert.equal(receipt.replyToTaskId, sent.id);
   assert.ok(sender.localState().sent.at(-1).repliedAt);
+});
+
+test("a dispatch opens its local conversation first and the answer lands in it", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const opened = [];
+  const dispatched = [];
+  const sender = createMeshRuntime({
+    copilotHome: resolve(home, "sender"),
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    conversationOpener: async (record, context) => {
+      opened.push({ id: record.id, peerName: record.peerName, task: record.task, createSession: context.createSession });
+      await context.onSessionCreated("conversation-1");
+      return { sessionId: "conversation-1" };
+    },
+    taskDispatcher: async (task, context) => {
+      dispatched.push({ id: task.id, sessionId: context.sessionId, createSession: context.createSession });
+      return { sessionId: context.sessionId, result: "Relayed the answer.", toolPolicy: "all" };
+    },
+  });
+  const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
+  t.after(async () => {
+    await sender.close();
+    await receiver.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await sender.initialize();
+  await receiver.initialize();
+  const senderPort = await sender.listen();
+  const receiverPort = await receiver.listen();
+  const peer = await sender.addPeer({
+    name: "conversation peer",
+    url: `http://127.0.0.1:${receiverPort}`,
+    token: receiver.localState({ includeToken: true }).token,
+  });
+
+  const sent = await sender.sendTask({ peerId: peer.id, task: "Report the free disk space on this machine." });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].id, sent.id);
+  assert.equal(opened[0].peerName, "conversation peer");
+  assert.equal(opened[0].createSession, true);
+  const record = sender.localState().sent.at(-1);
+  assert.equal(record.conversationSessionId, "conversation-1");
+
+  // A blank thread is a new conversation, exactly like dsh (`ui-${id}`), while
+  // an explicit thread continues the one already bound to it.
+  await sender.sendTask({ peerId: peer.id, task: "Now report the memory headroom too." });
+  assert.equal(opened.length, 2);
+  assert.equal(opened[1].createSession, true);
+  await sender.sendTask({
+    peerId: peer.id,
+    task: "Follow up in the same conversation.",
+    thread: record.thread,
+  });
+  assert.equal(opened.length, 3);
+  assert.equal(opened[2].createSession, false);
+
+  // The peer answers on the generated thread; the answer is appended to the
+  // conversation that holds the request.
+  const reply = await fetch(`http://127.0.0.1:${senderPort}/mesh/v1/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: `${sent.id}:answer`,
+      fromName: "conversation peer",
+      fromMachine: "conversation peer",
+      thread: record.thread,
+      noWake: true,
+      task: "df -h /data: 37G available out of 228G.",
+    }),
+  });
+  assert.equal(reply.status, 200);
+  for (let attempt = 0; attempt < 50 && dispatched.length === 0; attempt += 1) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].sessionId, "conversation-1");
+  assert.equal(dispatched[0].createSession, false);
+
+  // A noWake delivery expects no answer, so it opens no conversation.
+  await sender.sendTask({ peerId: peer.id, task: "Store this notice without waking anyone.", noWake: true });
+  assert.equal(opened.length, 3);
+  assert.equal(sender.localState().sent.at(0).conversationSkipped, "noWake deliveries expect no answer.");
 });

@@ -168,6 +168,7 @@ export class MeshRuntime {
     discoveryPort = MULTICAST_PORT,
     peerPortWindow = PEER_PORT_WINDOW,
     taskDispatcher,
+    conversationOpener,
     now = Date.now,
     onError,
   }) {
@@ -187,6 +188,7 @@ export class MeshRuntime {
     this.capabilities = null;
     this.discoveryError = "";
     this.taskDispatcher = taskDispatcher;
+    this.conversationOpener = conversationOpener;
     this.now = now;
     this.onError = onError;
     this.backgroundTasks = new Set();
@@ -952,13 +954,18 @@ export class MeshRuntime {
     if (typeof noWake !== "boolean") throw new Error("noWake must be a boolean.");
 
     const id = `t-${randomBytes(12).toString("hex")}`;
+    // dsh-plugin-mesh generates a thread when the UI leaves it blank, because a
+    // threadless dispatch has no binding key: the peer falls back to the task ID
+    // as its thread, our key never matches, and the answer can only open a new
+    // session. Generating one keeps both ends on the same key.
+    const threadLabel = thread || `ui-${id}`;
     const record = {
       id,
       peerId: target.id,
       peerName: target.name,
       paired: Boolean(paired),
       task,
-      thread,
+      thread: threadLabel,
       noWake,
       sentAt: new Date().toISOString(),
       status: "sending",
@@ -966,6 +973,69 @@ export class MeshRuntime {
     this.state.sent.push(record);
     this.state.sent = this.state.sent.slice(-MAX_HISTORY);
     await this.persist();
+
+    // Open the local conversation before contacting the peer. A reply is routed
+    // by peer address and thread, and dsh falls back to the task ID when a
+    // dispatch carries no thread, so binding that key here is what makes the
+    // answer land in this same conversation instead of a fresh session.
+    if (noWake) {
+      record.conversationSkipped = "noWake deliveries expect no answer.";
+    } else if (typeof this.conversationOpener === "function") {
+      const peerHost = paired
+        ? new URL(paired.url).hostname.replace(/^\[|\]$/g, "")
+        : String(discovered.host || "").replace(/^\[|\]$/g, "");
+      const routeKey = createHash("sha256")
+        .update(`${peerHost}\0${threadLabel}`)
+        .digest("hex");
+      const existing = this.state.routeSessions.find((entry) => entry.key === routeKey);
+      try {
+        const opened = await this.conversationOpener(
+          {
+            id,
+            fromName: target.name,
+            peerName: target.name,
+            peerHost,
+            thread: threadLabel,
+            task,
+            // dsh names the pre-created dispatch session after the thread and
+            // the peer, so the transcript is recognisable in the session list.
+            sessionName: `Mesh 派发 ${threadLabel.slice(0, 16)} → ${target.name}`,
+          },
+          {
+            routeKey,
+            sessionId: existing?.sessionId ?? null,
+            createSession: !existing?.sessionId,
+            onSessionCreated: async (sessionId) => {
+              if (typeof sessionId !== "string" || sessionId.length === 0) {
+                throw new Error("Mesh conversation opener returned an invalid session ID.");
+              }
+              const route = this.state.routeSessions.find((entry) => entry.key === routeKey);
+              if (route) {
+                route.sessionId = sessionId;
+                route.lastUsedAt = this.now();
+              } else {
+                this.state.routeSessions.push({
+                  key: routeKey,
+                  sessionId,
+                  createdAt: this.now(),
+                  lastUsedAt: this.now(),
+                });
+              }
+              this.state.routeSessions = this.state.routeSessions.slice(-MAX_HISTORY);
+              record.conversationSessionId = sessionId;
+              await this.persist();
+            },
+          },
+        );
+        if (opened && typeof opened.sessionId === "string" && opened.sessionId.length > 0) {
+          record.conversationSessionId = opened.sessionId;
+        }
+      } catch (error) {
+        // The peer is still worth contacting: a missing local transcript must
+        // not stop the dispatch.
+        record.conversationError = error.message;
+      }
+    }
 
     try {
       const response = await fetch(`${target.url}${API_PREFIX}/task`, {
@@ -981,7 +1051,7 @@ export class MeshRuntime {
           fromMachine: this.state.name,
           from: this.state.name,
           fromPort: this.port,
-          thread: thread || undefined,
+          thread: threadLabel,
           noWake,
           task,
         }),
@@ -1315,6 +1385,7 @@ export function createMeshRuntime({
   discoveryGroup,
   discoveryPort,
   taskDispatcher,
+  conversationOpener,
   now,
   onError,
 } = {}) {
@@ -1326,6 +1397,7 @@ export function createMeshRuntime({
     ...(discoveryGroup === undefined ? {} : { discoveryGroup }),
     ...(discoveryPort === undefined ? {} : { discoveryPort }),
     ...(taskDispatcher === undefined ? {} : { taskDispatcher }),
+    ...(conversationOpener === undefined ? {} : { conversationOpener }),
     ...(now === undefined ? {} : { now }),
     ...(onError === undefined ? {} : { onError }),
   });

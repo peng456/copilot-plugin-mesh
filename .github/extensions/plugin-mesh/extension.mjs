@@ -41,6 +41,7 @@ const taskSessions = createMeshTaskSessionManager();
 let extensionSession;
 const mesh = createMeshRuntime({
   taskDispatcher: taskSessions.dispatch,
+  conversationOpener: taskSessions.openConversation,
   onError: (error) => extensionSession?.log(`Mesh task dispatch failed: ${error.message}`, { level: "error" }),
 });
 
@@ -282,7 +283,7 @@ function renderHtml() {
             <div class="section-heading subheading"><h2>派发任务</h2><span class="count">按对端策略处理</span></div>
             <form id="task-form">
               <div class="field"><label for="task-peer">目标节点</label><select id="task-peer" required></select></div>
-              <div class="field"><label for="task-thread">线程标签（可选）</label><input id="task-thread" maxlength="128" placeholder="用于关联同一件事的后续请求" /></div>
+              <div class="field"><label for="task-thread">线程标签（可选）</label><input id="task-thread" maxlength="128" placeholder="留空则自动生成，用于关联同一件事的后续请求" /></div>
               <div class="field"><label for="task-text">任务请求</label><textarea id="task-text" maxlength="262144" required placeholder="写下你希望对端隔离任务会话处理的请求…"></textarea><p class="capability-note" id="task-wake-hint"></p></div>
               <label class="checkbox-field" for="task-no-wake"><input id="task-no-wake" type="checkbox" /><span>仅记录在对端收件箱，不唤醒 agent（noWake）</span></label>
               <div class="mesh-banner">默认按 DSH Mesh 协议发送普通任务；对端策略可能会唤醒 agent 或创建会话。只向你信任的节点派发。勾选 noWake 可要求对端仅记录。</div>
@@ -499,6 +500,16 @@ function renderHtml() {
               const decision = document.createElement("small");
               decision.textContent = task.dispatchError || task.routeDecision;
               card.append(decision);
+            }
+            if (!inbox) {
+              const conversation = task.conversationSessionId
+                ? "本地对话 " + task.conversationSessionId + "（对端回复会追加到同一对话）"
+                : task.conversationSkipped || (task.conversationError ? "本地对话创建失败：" + task.conversationError : "");
+              if (conversation) {
+                const note = document.createElement("small");
+                note.textContent = conversation;
+                card.append(note);
+              }
             }
             if (inbox && task.result) {
               const result = document.createElement("pre");
