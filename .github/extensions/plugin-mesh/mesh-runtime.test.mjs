@@ -23,7 +23,7 @@ test("mesh runtime does not silently switch ports when the requested port is una
   assert.equal(runtime.port, null);
 });
 
-test("paired local peers receive DSH-default and explicit noWake task requests for review", async (t) => {
+test("paired local peers receive normal and noWake tasks according to inbound policy", async (t) => {
   const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
   const sender = createMeshRuntime({ copilotHome: resolve(home, "sender"), port: 0, host: "127.0.0.1", discovery: false });
   const receiver = createMeshRuntime({ copilotHome: resolve(home, "receiver"), port: 0, host: "127.0.0.1", discovery: false });
@@ -73,7 +73,7 @@ test("paired local peers receive DSH-default and explicit noWake task requests f
   const noWakeTask = inbox.find((item) => item.task === "Keep this status notice in the inbox only.");
   assert.equal(normalTask.status, "awaiting-review");
   assert.equal(normalTask.noWake, false);
-  assert.equal(noWakeTask.status, "awaiting-review");
+  assert.equal(noWakeTask.status, "noted-only");
   assert.equal(noWakeTask.noWake, true);
 
   const authenticatedTasks = await fetch(`http://127.0.0.1:${receiverPort}/mesh/v1/tasks`, {
@@ -91,7 +91,76 @@ test("paired local peers receive DSH-default and explicit noWake task requests f
   assert.equal(receiverState.token.length, 32);
 });
 
-test("mesh endpoints reject public peer addresses and deduplicate task IDs", async (t) => {
+test("normal inbound tasks use isolated sessions with DSH filtering and thread limits", async (t) => {
+  const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
+  const dispatches = [];
+  let now = 10_000;
+  const runtime = createMeshRuntime({
+    copilotHome: home,
+    port: 0,
+    host: "127.0.0.1",
+    discovery: false,
+    now: () => now,
+    taskDispatcher: async (task, context) => {
+      dispatches.push({ id: task.id, ...context });
+      const sessionId = context.sessionId || `session-${task.thread || "default"}`;
+      await context.onSessionCreated(sessionId);
+      return { sessionId, result: `Handled: ${task.task}` };
+    },
+  });
+  t.after(async () => {
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
+  });
+
+  await runtime.initialize();
+  const port = await runtime.listen();
+  const send = async ({ id, task, thread = "topic", noWake = false, newSession = false }) => {
+    const response = await fetch(`http://127.0.0.1:${port}/mesh/v1/task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, task, thread, noWake, newSession }),
+    });
+    return response.json();
+  };
+  const waitForStatus = async (id, status) => {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const task = runtime.localState().inbox.find((entry) => entry.id === id);
+      if (task?.status === status) return task;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    assert.fail(`Task ${id} did not reach status ${status}.`);
+  };
+
+  const first = await send({ id: "route-first", task: "Please summarize this request." });
+  assert.equal(first.status, "dispatching");
+  const firstTask = await waitForStatus("route-first", "completed");
+  assert.equal(firstTask.result, "Handled: Please summarize this request.");
+  assert.equal(dispatches[0].createSession, true);
+
+  const second = await send({ id: "route-second", task: "Continue the same topic." });
+  assert.equal(second.status, "dispatching");
+  const secondTask = await waitForStatus("route-second", "completed");
+  assert.equal(secondTask.sessionId, firstTask.sessionId);
+  assert.equal(dispatches[1].createSession, false);
+
+  assert.equal((await send({ id: "route-no-wake", task: "Keep this notice only.", noWake: true })).status, "noted-only");
+  assert.equal((await send({ id: "route-short", task: "Thanks!" })).status, "noted-only");
+  assert.equal((await send({ id: "route-greeting", task: "你好" })).status, "noted-only");
+  assert.equal((await send({ id: "route-cooldown", task: "Start a new session now.", newSession: true })).status, "rate-limited");
+
+  for (let index = 0; index < 28; index += 1) {
+    await send({ id: `route-limit-${index}`, task: `Continue the request with step ${index}.` });
+  }
+  const limited = await send({ id: "route-limit-31", task: "This exceeds the hourly thread limit." });
+  assert.equal(limited.status, "rate-limited");
+  assert.equal(dispatches.length, 30);
+
+  now += 60 * 60_000;
+  assert.equal((await send({ id: "route-window-reset", task: "This is allowed in the next window." })).status, "dispatching");
+});
+
+test("private task submissions do not require pairing, but control endpoints remain protected", async (t) => {
   const home = await mkdtemp(resolve(tmpdir(), "copilot-mesh-test-"));
   const runtime = createMeshRuntime({ copilotHome: home, port: 0, host: "127.0.0.1", discovery: false });
   t.after(async () => {
@@ -107,11 +176,11 @@ test("mesh endpoints reject public peer addresses and deduplicate task IDs", asy
     /private, loopback, or link-local IP/,
   );
 
-  const postTask = () => fetch(`http://127.0.0.1:${port}/mesh/v1/task`, {
+  const postTask = (token) => fetch(`http://127.0.0.1:${port}/mesh/v1/task`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Dsh-Mesh-Token": local.token,
+      ...(token ? { "X-Dsh-Mesh-Token": token } : {}),
     },
     body: JSON.stringify({ id: "repeatable-test-id", fromName: "Peer", task: "Do not execute automatically." }),
   });
@@ -122,6 +191,7 @@ test("mesh endpoints reject public peer addresses and deduplicate task IDs", asy
   assert.equal((await first.json()).duplicate, false);
   assert.equal((await duplicate.json()).duplicate, true);
   assert.equal(runtime.localState().inbox.length, 1);
+  assert.equal(runtime.localState().inbox[0].status, "awaiting-review");
   await runtime.dismissTask("repeatable-test-id");
   assert.equal(runtime.localState().inbox[0].status, "dismissed");
 
@@ -134,6 +204,8 @@ test("mesh endpoints reject public peer addresses and deduplicate task IDs", asy
     headers: { "X-Dsh-Mesh-Token": "incorrect" },
   });
   assert.equal(invalidToken.status, 403);
+  const unauthenticatedRead = await fetch(`http://127.0.0.1:${port}/mesh/v1/tasks`);
+  assert.equal(unauthenticatedRead.status, 403);
 
   const invalidJson = await fetch(`http://127.0.0.1:${port}/mesh/v1/task`, {
     method: "POST",

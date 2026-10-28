@@ -12,11 +12,16 @@ const API_PREFIX = "/mesh/v1";
 const MAX_TASK_LENGTH = 256 * 1024;
 const MAX_REQUEST_LENGTH = MAX_TASK_LENGTH + 4096;
 const MAX_HISTORY = 200;
+const MIN_TASK_CHARS = 8;
+const THREAD_COOLDOWN_MS = 5_000;
+const THREAD_WINDOW_MS = 60 * 60_000;
+const MAX_WAKES_PER_THREAD = 30;
 const MULTICAST_GROUP = "239.255.42.99";
 const MULTICAST_PORT = 45892;
 const DEFAULT_PEER_PORT = 45917;
 const PEER_TTL_MS = 20_000;
 const PEER_KEEP_MS = 5 * 60_000;
+const NOTICE_ONLY_PATTERN = /^(?:hi|hello|hey|good morning|good afternoon|good evening|thanks|thank you|ok|okay|got it|understood|你好|您好|嗨|收到|好的|谢谢|感谢|明白了)[\s.!?,，。！？~～]*$/iu;
 const execFileAsync = promisify(execFile);
 
 function isPrivateAddress(address) {
@@ -151,7 +156,17 @@ async function probeCapabilities() {
 }
 
 export class MeshRuntime {
-  constructor({ storageFile, port = 45917, host = "0.0.0.0", discovery = true, discoveryGroup = MULTICAST_GROUP, discoveryPort = MULTICAST_PORT }) {
+  constructor({
+    storageFile,
+    port = 45917,
+    host = "0.0.0.0",
+    discovery = true,
+    discoveryGroup = MULTICAST_GROUP,
+    discoveryPort = MULTICAST_PORT,
+    taskDispatcher,
+    now = Date.now,
+    onError,
+  }) {
     this.storageFile = storageFile;
     this.requestedPort = port;
     this.host = host;
@@ -166,6 +181,10 @@ export class MeshRuntime {
     this.discoveryTimers = [];
     this.capabilities = null;
     this.discoveryError = "";
+    this.taskDispatcher = taskDispatcher;
+    this.now = now;
+    this.onError = onError;
+    this.backgroundTasks = new Set();
   }
 
   async initialize() {
@@ -194,6 +213,25 @@ export class MeshRuntime {
         discovered: Array.isArray(saved.discovered) ? saved.discovered.slice(-MAX_HISTORY) : [],
         inbox: saved.inbox.slice(-MAX_HISTORY),
         sent: saved.sent.slice(-MAX_HISTORY),
+        routeSessions: Array.isArray(saved.routeSessions)
+          ? saved.routeSessions.filter((entry) => entry && typeof entry.key === "string")
+            .map((entry) => ({
+              key: entry.key,
+              sessionId: typeof entry.sessionId === "string" ? entry.sessionId : null,
+              createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : 0,
+              lastUsedAt: Number.isFinite(entry.lastUsedAt) ? entry.lastUsedAt : 0,
+            })).slice(-MAX_HISTORY)
+          : [],
+        threadActivity: Array.isArray(saved.threadActivity)
+          ? saved.threadActivity.filter((entry) => entry && typeof entry.key === "string")
+            .map((entry) => ({
+              key: entry.key,
+              wakeTimes: Array.isArray(entry.wakeTimes)
+                ? entry.wakeTimes.filter((timestamp) => Number.isFinite(timestamp)).slice(-MAX_WAKES_PER_THREAD)
+                : [],
+              lastNewSessionAt: Number.isFinite(entry.lastNewSessionAt) ? entry.lastNewSessionAt : null,
+            })).slice(-MAX_HISTORY)
+          : [],
       };
       if (!/^[a-f0-9]{16}$/.test(this.state.nodeId) || !isValidPairingToken(this.state.token)) {
         throw new Error("Mesh state is missing a valid node identity or pairing token.");
@@ -213,6 +251,8 @@ export class MeshRuntime {
         discovered: [],
         inbox: [],
         sent: [],
+        routeSessions: [],
+        threadActivity: [],
       };
       this.state.instanceId = this.state.nodeId;
       await this.persist();
@@ -269,10 +309,13 @@ export class MeshRuntime {
     }
     this.port = this.server.address().port;
     if (this.discoveryEnabled) this.startDiscovery();
+    for (const task of this.state.inbox) {
+      if (task.status === "dispatching") this.startTaskDispatch(task.id);
+    }
     return this.port;
   }
 
-  close() {
+  async close() {
     for (const timer of this.discoveryTimers) clearInterval(timer);
     this.discoveryTimers = [];
     if (this.discoverySocket) {
@@ -283,10 +326,12 @@ export class MeshRuntime {
       }
       this.discoverySocket = null;
     }
-    if (!this.server?.listening) return Promise.resolve();
-    return new Promise((resolveClose, rejectClose) => {
-      this.server.close((error) => error ? rejectClose(error) : resolveClose());
-    });
+    if (this.server?.listening) {
+      await new Promise((resolveClose, rejectClose) => {
+        this.server.close((error) => error ? rejectClose(error) : resolveClose());
+      });
+    }
+    await Promise.allSettled(this.backgroundTasks);
   }
 
   async setName(value) {
@@ -559,6 +604,10 @@ export class MeshRuntime {
     const requestToken = request.headers["x-dsh-mesh-token"] || request.headers["x-plugin-mesh-token"];
     const paired = isValidToken(requestToken, this.state.token)
       || this.state.peers.some((peer) => isValidToken(requestToken, peer.token));
+    const requestAddress = request.socket.remoteAddress?.replace(/^::ffff:/, "") || "";
+    const isPrivateTaskSubmission = request.method === "POST"
+      && url.pathname === `${API_PREFIX}/task`
+      && isPrivateAddress(requestAddress);
     if (request.method === "GET" && url.pathname === `${API_PREFIX}/hello`) {
       this.sendJson(response, 200, {
         ok: true,
@@ -570,7 +619,7 @@ export class MeshRuntime {
       });
       return;
     }
-    if (!paired) {
+    if (!paired && !isPrivateTaskSubmission) {
       this.sendJson(response, 403, { ok: false, error: "Pairing token is missing or invalid." });
       return;
     }
@@ -649,12 +698,13 @@ export class MeshRuntime {
         originSession: typeof body.originSession === "string" ? body.originSession.slice(0, 128) : "",
         noWake: body.noWake === true,
         newSession: body.newSession === true,
+        authenticated: paired,
         workspace: typeof body.workspace === "string" ? body.workspace.slice(0, 512) : "",
         receivedAt: new Date().toISOString(),
         sourceAddress: request.socket.remoteAddress || "",
         transport: "lan",
         status: "awaiting-review",
-        routeDecision: "Stored for explicit user review; not injected into an agent session.",
+        routeDecision: "Stored for explicit user review.",
         dispatchError: "",
         replyTo: {
           machine: typeof body.fromMachine === "string" ? body.fromMachine.slice(0, 64) : "",
@@ -662,10 +712,12 @@ export class MeshRuntime {
           thread: typeof body.thread === "string" ? body.thread.slice(0, 128) : "",
         },
       };
+      this.prepareIncomingTask(task, requestAddress);
       this.state.inbox.push(task);
       this.state.inbox = this.state.inbox.slice(-MAX_HISTORY);
       await this.persist();
       this.sendJson(response, 200, { ok: true, id, duplicate: false, status: task.status });
+      if (task.status === "dispatching") this.startTaskDispatch(task.id);
       return;
     }
     this.sendJson(response, 404, { ok: false, error: "Not found." });
@@ -881,6 +933,113 @@ export class MeshRuntime {
     await this.persist();
     return { dismissed: true, id };
   }
+
+  prepareIncomingTask(task, requestAddress) {
+    const text = task.task.trim();
+    if (task.noWake) {
+      task.status = "noted-only";
+      task.routeDecision = "The sender requested noWake; the task is stored without creating a session.";
+      return;
+    }
+    if ([...text].length < MIN_TASK_CHARS || NOTICE_ONLY_PATTERN.test(text)) {
+      task.status = "noted-only";
+      task.routeDecision = "Short or notice-only message; no session was created.";
+      return;
+    }
+    if (typeof this.taskDispatcher !== "function") {
+      task.status = "awaiting-review";
+      task.routeDecision = "No isolated task-session dispatcher is available.";
+      return;
+    }
+
+    const threadName = task.thread || task.originSession || "default";
+    const threadKey = createHash("sha256")
+      .update(`${requestAddress}\0${threadName}`)
+      .digest("hex");
+    const now = this.now();
+    let activity = this.state.threadActivity.find((entry) => entry.key === threadKey);
+    if (!activity) {
+      activity = { key: threadKey, wakeTimes: [], lastNewSessionAt: null };
+      this.state.threadActivity.push(activity);
+    }
+    activity.wakeTimes = activity.wakeTimes.filter((timestamp) =>
+      timestamp <= now && now - timestamp < THREAD_WINDOW_MS,
+    );
+    const route = this.state.routeSessions.find((entry) => entry.key === threadKey);
+    const createSession = task.newSession || !route;
+    if (activity.wakeTimes.length >= MAX_WAKES_PER_THREAD) {
+      task.status = "rate-limited";
+      task.routeDecision = "Thread wake limit reached (30 per hour).";
+      return;
+    }
+    if (createSession && activity.lastNewSessionAt !== null && now - activity.lastNewSessionAt < THREAD_COOLDOWN_MS) {
+      task.status = "rate-limited";
+      task.routeDecision = "New-session cooldown active for this thread.";
+      return;
+    }
+
+    if (createSession) {
+      activity.lastNewSessionAt = now;
+      const newRoute = { key: threadKey, sessionId: null, createdAt: now, lastUsedAt: now };
+      if (route) Object.assign(route, newRoute);
+      else this.state.routeSessions.push(newRoute);
+    }
+    activity.wakeTimes.push(now);
+    this.state.threadActivity = this.state.threadActivity.slice(-MAX_HISTORY);
+    this.state.routeSessions = this.state.routeSessions.slice(-MAX_HISTORY);
+    task.threadKey = threadKey;
+    task.createSession = createSession;
+    task.status = "dispatching";
+    task.routeDecision = "Queued in an isolated task session with tools disabled.";
+  }
+
+  startTaskDispatch(id) {
+    const operation = this.dispatchIncomingTask(id);
+    this.backgroundTasks.add(operation);
+    operation.catch((error) => {
+      this.onError?.(error);
+    }).finally(() => {
+      this.backgroundTasks.delete(operation);
+    });
+  }
+
+  async dispatchIncomingTask(id) {
+    const task = this.state.inbox.find((entry) => entry.id === id);
+    if (!task || task.status !== "dispatching") return;
+    try {
+      const route = this.state.routeSessions.find((entry) => entry.key === task.threadKey);
+      const result = await this.taskDispatcher(task, {
+        routeKey: task.threadKey,
+        sessionId: route?.sessionId ?? null,
+        createSession: task.createSession === true,
+        onSessionCreated: async (sessionId) => {
+          if (typeof sessionId !== "string" || sessionId.length === 0) {
+            throw new Error("Task-session dispatcher returned an invalid session ID.");
+          }
+          const currentRoute = this.state.routeSessions.find((entry) => entry.key === task.threadKey);
+          if (currentRoute) {
+            currentRoute.sessionId = sessionId;
+            currentRoute.lastUsedAt = this.now();
+          }
+          task.sessionId = sessionId;
+          await this.persist();
+        },
+      });
+      if (!result || typeof result.sessionId !== "string" || result.sessionId.length === 0) {
+        throw new Error("Task-session dispatcher did not return a session ID.");
+      }
+      task.sessionId = result.sessionId;
+      task.result = typeof result.result === "string" ? result.result.slice(0, 16_384) : "";
+      task.status = "completed";
+      task.routeDecision = "Completed in an isolated task session with tools disabled.";
+      if (route) route.lastUsedAt = this.now();
+    } catch (error) {
+      task.status = "failed";
+      task.dispatchError = error instanceof Error ? error.message.slice(0, 512) : "Unknown task-session error.";
+      task.routeDecision = "The isolated task session could not complete the request.";
+    }
+    await this.persist();
+  }
 }
 
 export function createMeshRuntime({
@@ -890,6 +1049,9 @@ export function createMeshRuntime({
   discovery,
   discoveryGroup,
   discoveryPort,
+  taskDispatcher,
+  now,
+  onError,
 } = {}) {
   return new MeshRuntime({
     storageFile: resolve(copilotHome, "extensions", "plugin-mesh", "artifacts", "mesh-state.json"),
@@ -898,5 +1060,8 @@ export function createMeshRuntime({
     ...(discovery === undefined ? {} : { discovery }),
     ...(discoveryGroup === undefined ? {} : { discoveryGroup }),
     ...(discoveryPort === undefined ? {} : { discoveryPort }),
+    ...(taskDispatcher === undefined ? {} : { taskDispatcher }),
+    ...(now === undefined ? {} : { now }),
+    ...(onError === undefined ? {} : { onError }),
   });
 }
